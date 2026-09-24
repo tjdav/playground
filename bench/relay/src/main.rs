@@ -105,9 +105,6 @@ async fn handle_socket(socket: WebSocket, id: String, state: AppState) {
         _ = &mut recv_task => send_task.abort(),
     }
 
-    let _ = send_task.await;
-    let _ = recv_task.await;
-
     info!(conversation_id = %id, "disconnected");
 
     let mut map = state.write().await;
