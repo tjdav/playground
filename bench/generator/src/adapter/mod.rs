@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 
+pub mod sse;
 pub mod ws;
 
 #[async_trait]

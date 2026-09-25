@@ -11,6 +11,7 @@ mod client;
 mod metrics;
 mod scenario;
 
+use crate::adapter::sse::SseAdapter;
 use crate::adapter::ws::WsAdapter;
 use crate::adapter::TransportAdapter;
 use crate::metrics::MetricsConfig;
@@ -23,6 +24,12 @@ struct Args {
 
     #[arg(long, default_value = "ws://127.0.0.1:8080")]
     url: String,
+
+    #[arg(long, default_value = "http://127.0.0.1:8090")]
+    pb_url: String,
+
+    #[arg(long, default_value = "bench")]
+    pb_conversation: String,
 
     #[arg(long, default_value = "bench")]
     conversation: String,
@@ -55,14 +62,18 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    if args.transport != "ws" {
-        anyhow::bail!("Only 'ws' transport is supported in this task.");
-    }
     if args.payload_bytes < 16 {
         anyhow::bail!("payload-bytes must be at least 16.");
     }
 
-    let adapter: Arc<dyn TransportAdapter> = Arc::new(WsAdapter::new(args.url.clone()));
+    let adapter: Arc<dyn TransportAdapter> = match args.transport.as_str() {
+        "ws" => Arc::new(WsAdapter::new(args.url.clone())),
+        "sse" => Arc::new(SseAdapter::new(
+            args.pb_url.clone(),
+            args.pb_conversation.clone(),
+        )),
+        other => anyhow::bail!("unsupported transport: {other}"),
+    };
 
     let (metrics_tx, metrics_rx) = mpsc::unbounded_channel();
     let metrics_config = MetricsConfig {
@@ -84,7 +95,15 @@ async fn main() -> anyhow::Result<()> {
 
     for i in 0..args.receivers {
         let adapter_clone = adapter.clone();
-        let conversation_clone = args.conversation.clone();
+
+        // For SSE, the conversation field in SseAdapter is already pb_conversation,
+        // but connect() takes the conversation ID as well.
+        let conversation_clone = if args.transport == "sse" {
+            args.pb_conversation.clone()
+        } else {
+            args.conversation.clone()
+        };
+
         let barrier_clone = barrier.clone();
         let metrics_tx_clone = metrics_tx.clone();
         let shutdown_rx_clone = shutdown_rx.clone();
@@ -110,7 +129,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn sender task
     let adapter_clone = adapter.clone();
-    let conversation_clone = args.conversation.clone();
+    let conversation_clone = if args.transport == "sse" {
+        args.pb_conversation.clone()
+    } else {
+        args.conversation.clone()
+    };
+
     let barrier_clone = barrier.clone();
     let messages = args.messages;
     let rate = args.rate;

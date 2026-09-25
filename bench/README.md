@@ -191,3 +191,32 @@ To stop the instance and completely reset the database data (useful if you need 
 ```bash
 docker compose -f bench/pocketbase/docker-compose.yml down -v
 ```
+
+## Running the SSE Baseline
+
+The SSE transport implementation connects to a PocketBase instance to benchmark Server-Sent Events for server-to-client delivery and REST POST for client-to-server sending. Note that because sends go over REST, the round-trip time is higher than WebSocket by design.
+
+**Prerequisite:** The PocketBase Docker container from Task 3.1 must be running.
+
+### Example Baseline Invocation
+
+```bash
+./target/release/generator \
+  --transport sse \
+  --pb-url http://127.0.0.1:8090 \
+  --pb-conversation bench \
+  --receivers 10 \
+  --messages 100 \
+  --payload-bytes 1024 \
+  --rate 10 \
+  --warmup-secs 2 \
+  --output sse-results.jsonl
+```
+
+### Analyzing Metrics
+
+Run the analysis script just like you would for WebSocket results:
+
+```bash
+python3 scripts/analyze.py sse-results.jsonl
+```
