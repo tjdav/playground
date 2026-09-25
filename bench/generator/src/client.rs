@@ -118,6 +118,9 @@ pub async fn receiver_task(
     Ok(())
 }
 
+use rand::Rng;
+
+#[allow(clippy::too_many_arguments)]
 pub async fn sender_task(
     adapter: Arc<dyn TransportAdapter>,
     conversation_id: String,
@@ -125,6 +128,7 @@ pub async fn sender_task(
     messages: u32,
     rate: f64,
     payload_bytes: usize,
+    payload_mix: Option<String>,
     warmup_secs: u64,
 ) -> anyhow::Result<()> {
     let mut connection = match adapter.connect(&conversation_id).await {
@@ -147,10 +151,34 @@ pub async fn sender_task(
     // Don't burst if we are behind immediately
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let parsed_mix: Option<Vec<(usize, f64)>> = payload_mix.map(|m| {
+        let mut mix = Vec::new();
+        for part in m.split(',') {
+            let mut iter = part.split(':');
+            let size = iter.next().unwrap().parse::<usize>().unwrap();
+            let weight = iter.next().unwrap().parse::<f64>().unwrap();
+            mix.push((size, weight));
+        }
+        mix
+    });
+
     for client_message_id in 0..messages {
         interval.tick().await;
 
-        let mut payload_buf = BytesMut::with_capacity(payload_bytes);
+        let mut chosen_size = payload_bytes;
+        if let Some(ref mix) = parsed_mix {
+            let r: f64 = rand::thread_rng().gen_range(0.0..100.0);
+            let mut accum = 0.0;
+            for &(size, weight) in mix {
+                accum += weight;
+                if r <= accum {
+                    chosen_size = size;
+                    break;
+                }
+            }
+        }
+
+        let mut payload_buf = BytesMut::with_capacity(chosen_size);
         payload_buf.put_u64(client_message_id as u64);
 
         let send_ts = SystemTime::now()
@@ -160,7 +188,7 @@ pub async fn sender_task(
         payload_buf.put_u64(send_ts);
 
         // Fill the rest with random bytes
-        let mut random_bytes = scenario::generate_payload(payload_bytes);
+        let mut random_bytes = scenario::generate_payload(chosen_size);
         // Overwrite the first 16 bytes of random payload with header
         random_bytes[0..16].copy_from_slice(&payload_buf[..16]);
 

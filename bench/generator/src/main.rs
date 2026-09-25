@@ -62,6 +62,9 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     payload_bytes: usize,
 
+    #[arg(long)]
+    payload_mix: Option<String>,
+
     #[arg(long, default_value_t = 10.0)]
     rate: f64,
 
@@ -166,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
     let messages = args.messages;
     let rate = args.rate;
     let payload_bytes = args.payload_bytes;
+    let payload_mix = args.payload_mix.clone();
     let warmup_secs = args.warmup_secs;
 
     let sender_handle = tokio::spawn(async move {
@@ -176,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
             messages,
             rate,
             payload_bytes,
+            payload_mix,
             warmup_secs,
         )
         .await;

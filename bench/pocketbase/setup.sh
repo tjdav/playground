@@ -83,7 +83,6 @@ PAYLOAD='{
       "unique": false,
       "options": {
         "min": null,
-        "max": null,
         "pattern": ""
       }
     },
@@ -116,14 +115,12 @@ PAYLOAD='{
     {
       "system": false,
       "name": "payload_b64",
-      "type": "text",
+      "type": "json",
       "required": true,
       "presentable": false,
       "unique": false,
       "options": {
-        "min": null,
-        "max": null,
-        "pattern": ""
+        "maxSize": 2000000
       }
     }
   ],
