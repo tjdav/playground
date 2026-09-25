@@ -18,6 +18,98 @@ To run the project:
 ```
 The relay binds to `127.0.0.1:8080`. You can configure the port by setting the `PORT` environment variable (e.g., `PORT=8081 ./target/release/relay`).
 
+## Generator Usage
+The generator is a load testing tool designed to test the relay and compute performance metrics.
+
+### Building and Running the Generator
+The generator is built with the workspace:
+```bash
+cd bench
+cargo build --release
+```
+
+Ensure the relay is running, then run the generator.
+
+### Scenarios
+Here are five example invocations for common scenarios:
+
+1. **Baseline** (10 receivers, 1 KB, 1 msg/s, 60s):
+```bash
+./target/release/generator \
+  --transport ws \
+  --url ws://127.0.0.1:8080 \
+  --conversation baseline \
+  --receivers 10 \
+  --messages 60 \
+  --payload-bytes 1024 \
+  --rate 1 \
+  --warmup-secs 5 \
+  --output baseline.jsonl
+```
+
+2. **Small group** (50 receivers, 1 KB, 10 msg/s, 120s):
+```bash
+./target/release/generator \
+  --transport ws \
+  --url ws://127.0.0.1:8080 \
+  --conversation small_group \
+  --receivers 50 \
+  --messages 1200 \
+  --payload-bytes 1024 \
+  --rate 10 \
+  --warmup-secs 5 \
+  --output small_group.jsonl
+```
+
+3. **Large group** (500 receivers, 1 KB, 10 msg/s, 120s):
+```bash
+./target/release/generator \
+  --transport ws \
+  --url ws://127.0.0.1:8080 \
+  --conversation large_group \
+  --receivers 500 \
+  --messages 1200 \
+  --payload-bytes 1024 \
+  --rate 10 \
+  --warmup-secs 5 \
+  --output large_group.jsonl
+```
+
+4. **Welcome burst** (50 receivers, 32 KB, 1 msg/s for 10s, 60s total):
+```bash
+./target/release/generator \
+  --transport ws \
+  --url ws://127.0.0.1:8080 \
+  --conversation welcome_burst \
+  --receivers 50 \
+  --messages 10 \
+  --payload-bytes 32768 \
+  --rate 1 \
+  --warmup-secs 5 \
+  --output welcome_burst.jsonl
+```
+
+5. **Mixed** (100 receivers, mixed payload sizes, 10 msg/s, 300s):
+*(Note: Mixed payload logic is currently out of scope and requires future extensions. A placeholder uniform run is shown below).*
+```bash
+./target/release/generator \
+  --transport ws \
+  --url ws://127.0.0.1:8080 \
+  --conversation mixed \
+  --receivers 100 \
+  --messages 3000 \
+  --payload-bytes 1024 \
+  --rate 10 \
+  --warmup-secs 5 \
+  --output mixed.jsonl
+```
+
+### Analyzing Metrics
+After running the generator, you can parse the JSONL output using the provided script:
+```bash
+python3 scripts/analyze.py results.jsonl
+```
+
 ## API Endpoints
 
 ### `GET /health`
