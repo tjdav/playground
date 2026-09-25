@@ -11,6 +11,7 @@ mod client;
 mod metrics;
 mod scenario;
 
+use crate::adapter::sockudo::{SockudoAdapter, SockudoConfig};
 use crate::adapter::sse::SseAdapter;
 use crate::adapter::ws::WsAdapter;
 use crate::adapter::TransportAdapter;
@@ -30,6 +31,24 @@ struct Args {
 
     #[arg(long, default_value = "bench")]
     pb_conversation: String,
+
+    #[arg(long, default_value = "http://127.0.0.1:6001")]
+    sockudo_url: String,
+
+    #[arg(long, default_value = "ws://127.0.0.1:6001")]
+    sockudo_ws_url: String,
+
+    #[arg(long, default_value = "bench-app")]
+    sockudo_app_id: String,
+
+    #[arg(long, default_value = "bench-key")]
+    sockudo_app_key: String,
+
+    #[arg(long, default_value = "bench-secret")]
+    sockudo_app_secret: String,
+
+    #[arg(long, default_value = "bench-channel")]
+    sockudo_channel: String,
 
     #[arg(long, default_value = "bench")]
     conversation: String,
@@ -72,6 +91,14 @@ async fn main() -> anyhow::Result<()> {
             args.pb_url.clone(),
             args.pb_conversation.clone(),
         )),
+        "sockudo" => Arc::new(SockudoAdapter::new(SockudoConfig {
+            http_base: args.sockudo_url.clone(),
+            ws_base: args.sockudo_ws_url.clone(),
+            app_id: args.sockudo_app_id.clone(),
+            app_key: args.sockudo_app_key.clone(),
+            app_secret: args.sockudo_app_secret.clone(),
+            channel: args.sockudo_channel.clone(),
+        })),
         other => anyhow::bail!("unsupported transport: {other}"),
     };
 

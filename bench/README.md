@@ -220,3 +220,60 @@ Run the analysis script just like you would for WebSocket results:
 ```bash
 python3 scripts/analyze.py sse-results.jsonl
 ```
+
+## Sockudo Setup
+
+The benchmark uses Sockudo as Track B, providing a high-performance Rust WebSocket server implementing the Pusher protocol.
+
+### Starting Sockudo
+To start the Sockudo instance in the background:
+```bash
+docker compose -f bench/sockudo/docker-compose.yml up -d
+```
+
+### Verification
+To verify the setup was successful, you can run:
+```bash
+curl http://127.0.0.1:6001/up/bench-app
+```
+It should return `{"status":"ok"}`.
+
+### App Credentials
+The instance is configured with default app credentials via the `.env` template:
+```
+SOCKUDO_DEFAULT_APP_ID=bench-app
+SOCKUDO_DEFAULT_APP_KEY=bench-key
+SOCKUDO_DEFAULT_APP_SECRET=bench-secret
+```
+These match the defaults used in the generator.
+
+## Running the Sockudo Baseline
+
+The Sockudo transport implements the Pusher protocol. Note an intentional asymmetry: the WebSocket connection is subscribe-only for public channels, so all published messages go through the HTTP POST endpoint (similar to the SSE transport).
+
+### Example Baseline Invocation
+
+```bash
+./target/release/generator \
+  --transport sockudo \
+  --sockudo-url http://127.0.0.1:6001 \
+  --sockudo-ws-url ws://127.0.0.1:6001 \
+  --sockudo-app-id bench-app \
+  --sockudo-app-key bench-key \
+  --sockudo-app-secret bench-secret \
+  --sockudo-channel bench-channel \
+  --receivers 10 \
+  --messages 100 \
+  --payload-bytes 1024 \
+  --rate 10 \
+  --warmup-secs 2 \
+  --output sockudo-results.jsonl
+```
+
+### Analyzing Metrics
+
+Run the analysis script just like you would for WebSocket or SSE results, providing side-by-side comparison capabilities if needed:
+
+```bash
+python3 scripts/analyze.py sockudo-results.jsonl
+```

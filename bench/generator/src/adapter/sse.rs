@@ -128,7 +128,11 @@ impl Connection for SseConnection {
             anyhow::bail!("payload too small to extract client_message_id");
         }
 
-        let client_message_id = u64::from_be_bytes(payload[0..8].try_into().context("failed to read client_message_id")?);
+        let client_message_id = u64::from_be_bytes(
+            payload[0..8]
+                .try_into()
+                .context("failed to read client_message_id")?,
+        );
 
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
         let payload_b64 = BASE64.encode(&payload);
