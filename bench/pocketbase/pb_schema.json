@@ -50,14 +50,12 @@
       "system": false,
       "id": "payload_b64",
       "name": "payload_b64",
-      "type": "text",
+      "type": "json",
       "required": true,
       "presentable": false,
       "unique": false,
       "options": {
-        "min": null,
-        "max": null,
-        "pattern": ""
+        "maxSize": 2000000
       }
     }
   ],
