@@ -153,3 +153,41 @@ ws1.on('open', function open() {
   ws1.send(Buffer.from('hello from ws1'));
 });
 ```
+## PocketBase Setup
+
+The benchmark uses PocketBase as Track A (SSE for server-to-client delivery and REST for client-to-server sends). The deployment is managed via Docker Compose and uses PocketBase version 0.23+.
+
+### Starting PocketBase
+To start the PocketBase instance in the background:
+```bash
+docker compose -f bench/pocketbase/docker-compose.yml up -d
+```
+
+### Provisioning Collections
+Before running the setup script, you can configure the admin credentials using environment variables. A template is provided in `bench/pocketbase/.env.example`:
+```bash
+export PB_ADMIN_EMAIL=admin@example.com
+export PB_ADMIN_PASSWORD=changeme123
+```
+
+Run the setup script to initialize the admin account and provision the required `bench_messages` collection:
+```bash
+bash bench/pocketbase/setup.sh
+```
+
+### Verification
+To verify the setup was successful, you can check that the collection exists:
+```bash
+curl http://127.0.0.1:8090/api/collections/bench_messages/records
+```
+
+### Stopping and Resetting
+To stop the PocketBase instance:
+```bash
+docker compose -f bench/pocketbase/docker-compose.yml down
+```
+
+To stop the instance and completely reset the database data (useful if you need a fresh start):
+```bash
+docker compose -f bench/pocketbase/docker-compose.yml down -v
+```

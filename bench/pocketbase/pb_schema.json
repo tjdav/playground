@@ -1,0 +1,74 @@
+{
+  "name": "bench_messages",
+  "type": "base",
+  "system": false,
+  "description": "NOTE: Access rules are completely open (\"\"). This is intentional because the container binds to 127.0.0.1 only, and this is a benchmark harness, not a production service.",
+  "fields": [
+    {
+      "system": false,
+      "id": "conversation",
+      "name": "conversation",
+      "type": "text",
+      "required": true,
+      "presentable": false,
+      "unique": false,
+      "options": {
+        "min": null,
+        "max": null,
+        "pattern": ""
+      }
+    },
+    {
+      "system": false,
+      "id": "client_message_id",
+      "name": "client_message_id",
+      "type": "number",
+      "required": true,
+      "presentable": false,
+      "unique": false,
+      "options": {
+        "min": null,
+        "max": null,
+        "noDecimal": false
+      }
+    },
+    {
+      "system": false,
+      "id": "sender_id",
+      "name": "sender_id",
+      "type": "number",
+      "required": false,
+      "presentable": false,
+      "unique": false,
+      "options": {
+        "min": null,
+        "max": null,
+        "noDecimal": false
+      }
+    },
+    {
+      "system": false,
+      "id": "payload_b64",
+      "name": "payload_b64",
+      "type": "text",
+      "required": true,
+      "presentable": false,
+      "unique": false,
+      "options": {
+        "min": null,
+        "max": null,
+        "pattern": ""
+      }
+    }
+  ],
+  "indexes": [
+    "CREATE INDEX `idx_conversation` ON `bench_messages` (`conversation`)",
+    "CREATE INDEX `idx_client_message_id` ON `bench_messages` (`client_message_id`)"
+  ],
+  "listRule": "",
+  "viewRule": "",
+  "createRule": "",
+  "updateRule": "",
+  "deleteRule": "",
+  "options": {}
+}
