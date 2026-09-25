@@ -1,0 +1,23 @@
+services:
+  sockudo:
+    image: ghcr.io/sockudo/sockudo:4.6.0
+    ports:
+      - "127.0.0.1:6001:6001"
+      - "127.0.0.1:9601:9601"
+    environment:
+      RUST_LOG: "info"
+      HOST: "0.0.0.0"
+      PORT: "6001"
+      METRICS_PORT: "9601"
+      SOCKUDO_DEFAULT_APP_ID: "bench-app"
+      SOCKUDO_DEFAULT_APP_KEY: "bench-key"
+      SOCKUDO_DEFAULT_APP_SECRET: "bench-secret"
+      SOCKUDO_DEFAULT_APP_MAX_CONNECTIONS: "5000"
+      ADAPTER_DRIVER: "memory"
+      CACHE_DRIVER: "memory"
+      QUEUE_DRIVER: "memory"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:6001/up/bench-app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
