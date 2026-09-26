@@ -1,5 +1,13 @@
 # Transport Comparison Report
 
+## Run Status
+
+| Transport | Baseline | Small group | Large group | Welcome burst | Mixed |
+|---|---|---|---|---|---|
+| ws | complete | complete | complete | complete | complete |
+| sse | pending | pending | pending | pending | pending |
+| sockudo | pending | pending | pending | pending | pending |
+
 > **Note:** Some combinations are missing and displayed as N/A.
 
 ## Section 1 — Per-scenario latency
@@ -7,37 +15,37 @@
 ### Scenario: Baseline
 | Transport | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|
-| ws | 0.66 | 0.87 | 1.04 | 1.08 |
+| ws | 0.60 | 0.85 | 1.08 | 1.23 |
 | sse | N/A | N/A | N/A | N/A |
 | sockudo | N/A | N/A | N/A | N/A |
 
 ### Scenario: Small Group
 | Transport | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|
-| ws | 0.92 | 1.24 | 1.46 | 1.91 |
+| ws | 0.88 | 1.24 | 1.60 | 2.74 |
 | sse | N/A | N/A | N/A | N/A |
 | sockudo | N/A | N/A | N/A | N/A |
 
 ### Scenario: Large Group
 | Transport | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|
-| ws | 3.76 | 6.58 | 8.07 | 11.40 |
+| ws | 3.50 | 5.99 | 7.16 | 12.27 |
 | sse | N/A | N/A | N/A | N/A |
 | sockudo | N/A | N/A | N/A | N/A |
 
 ### Scenario: Welcome Burst
 | Transport | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|
-| ws | N/A | N/A | N/A | N/A |
-| sse | 14.04 | 21.77 | 27.62 | 33.83 |
-| sockudo | 3.95 | 4.94 | 6.15 | 6.75 |
+| ws | 1.34 | 1.72 | 1.98 | 2.25 |
+| sse | N/A | N/A | N/A | N/A |
+| sockudo | N/A | N/A | N/A | N/A |
 
 ### Scenario: Mixed
 | Transport | p50 (ms) | p95 (ms) | p99 (ms) | Max (ms) |
 |---|---|---|---|---|
-| ws | N/A | N/A | N/A | N/A |
-| sse | 8.58 | 23.02 | 35.56 | 103.68 |
-| sockudo | 3.31 | 5.80 | 7.26 | 11.69 |
+| ws | 1.20 | 1.89 | 2.35 | 5.48 |
+| sse | N/A | N/A | N/A | N/A |
+| sockudo | N/A | N/A | N/A | N/A |
 
 ## Section 2 — Delivery completeness
 
@@ -46,27 +54,27 @@
 | Baseline | 100.00% | N/A | N/A |
 | Small group | 100.00% | N/A | N/A |
 | Large group | 100.00% | N/A | N/A |
-| Welcome burst | N/A | 100.00% | 100.00% |
-| Mixed | N/A | 100.00% | 100.00% |
+| Welcome burst | 100.00% | N/A | N/A |
+| Mixed | 100.00% | N/A | N/A |
 
 ## Section 3 — Connection establishment (ms)
 
 | Scenario | ws p50 | ws p95 | sse p50 | sse p95 | sockudo p50 | sockudo p95 |
 |---|---|---|---|---|---|---|
-| Baseline | 0.10 | 1.48 | N/A | N/A | N/A | N/A |
-| Small group | 2.19 | 3.67 | N/A | N/A | N/A | N/A |
-| Large group | 28.59 | 42.01 | N/A | N/A | N/A | N/A |
-| Welcome burst | N/A | N/A | 21.04 | 24.99 | 1922.17 | 3673.90 |
-| Mixed | N/A | N/A | 36.54 | 38.91 | 3805.42 | 8215.75 |
+| Baseline | 0.97 | 1.13 | N/A | N/A | N/A | N/A |
+| Small group | 1.75 | 4.25 | N/A | N/A | N/A | N/A |
+| Large group | 34.32 | 53.59 | N/A | N/A | N/A | N/A |
+| Welcome burst | 3.25 | 6.05 | N/A | N/A | N/A | N/A |
+| Mixed | 12.51 | 14.13 | N/A | N/A | N/A | N/A |
 
 ## Section 4 — Resource profile at 500 connections (Large group scenario)
 
 | Transport | Peak RSS (MB) | Mean CPU (%) | Peak FDs |
 |---|---|---|---|
-| ws | 70.83 | 1.34 | 511 |
+| ws | 71.26 | 1.29 | 511 |
 | sse | N/A | N/A | N/A |
 | sockudo | N/A | N/A | N/A |
 
 ## Section 5 — Verdict
 
-Ws had the lowest p95 latency in 3 of 5 scenarios. Ws had the highest average delivery completeness (60.00%). Ws used the least memory (70.83 MB) at 500 connections. However, in the welcome burst, mixed scenario(s), a different transport had lower latency. All transports performed adequately, but Ws appears to be the overall winner for this workload.
+**Insufficient data for a verdict.** Only 1 transport(s) have data for at least 3 scenarios. Complete the matrix and regenerate this report.

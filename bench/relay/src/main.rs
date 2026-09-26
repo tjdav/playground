@@ -94,7 +94,7 @@ async fn handle_socket(socket: WebSocket, id: String, state: AppState) {
     let mut recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = receiver.next().await {
             if let Message::Binary(bytes) = msg {
-                info!(conversation_id = %id_for_recv, bytes = bytes.len(), "broadcast");
+                tracing::debug!(conversation_id = %id_for_recv, bytes = bytes.len(), "broadcast");
                 let _ = tx_for_recv.send(bytes);
             }
         }
