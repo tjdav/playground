@@ -76,6 +76,20 @@ skip_scenario() {
     return 1
 }
 
+update_manifest() {
+  local transport="$1" scenario="$2" status="$3"
+  local manifest="bench/results/run-manifest.json"
+  local tmp="${manifest}.tmp"
+
+  if [ ! -f "$manifest" ]; then
+    echo '{}' > "$manifest"
+  fi
+
+  jq --arg t "$transport" --arg s "$scenario" --arg st "$status" \
+    '.[$t] = (.[$t] // {}) | .[$t][$s] = $st' \
+    "$manifest" > "$tmp" && mv "$tmp" "$manifest"
+}
+
 declare -A SCENARIOS=(
     ["baseline"]="--receivers 10 --payload-bytes 1024 --rate 1 --messages 60 --warmup-secs 5"
     ["small-group"]="--receivers 50 --payload-bytes 1024 --rate 10 --messages 1200 --warmup-secs 10"
@@ -131,10 +145,7 @@ for transport in "${TRANSPORTS[@]}"; do
         if [ "$transport" == "ws" ]; then
             > bench/relay.log
         fi
-        if [ ! -f bench/results/run-manifest.json ]; then
-            echo '{"ws":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"},"sse":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"},"sockudo":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"}}' > bench/results/run-manifest.json
-        fi
-        jq '.[$transport][$scenario] = "running"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+        update_manifest "$transport" "$scenario" "running"
         echo "--- Running scenario: ${scenario} ---"
         rm -f "$OUT_JSON" "$OUT_CSV"
 
@@ -174,12 +185,12 @@ for transport in "${TRANSPORTS[@]}"; do
         if [ $GEN_EXIT -ne 0 ]; then
             echo "ERROR: Generator failed for ${transport}-${scenario}"
             rm -f "$OUT_JSON"
-            jq '.[$transport][$scenario] = "failed: exit \($GEN_EXIT)"' --arg transport "$transport" --arg scenario "$scenario" --arg GEN_EXIT "$GEN_EXIT" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+            update_manifest "$transport" "$scenario" "failed: exit $GEN_EXIT"
         else
             if [ ! -f "$OUT_JSON" ] || ! grep -q '"latency_us"' "$OUT_JSON"; then
-                jq '.[$transport][$scenario] = "empty"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+                update_manifest "$transport" "$scenario" "empty"
             else
-                jq '.[$transport][$scenario] = "complete"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+                update_manifest "$transport" "$scenario" "complete"
             fi
         fi
         sync

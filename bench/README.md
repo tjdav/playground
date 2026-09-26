@@ -285,3 +285,11 @@ To prevent excessive disk usage, the `run-matrix.sh` runner truncates `relay.log
 
 ### Run Manifest
 The runner natively maintains a JSON state file called `bench/results/run-manifest.json` across all benchmark runs. It logs the individual execution statuses of all 15 permutations (5 scenarios across 3 transports). Potential statuses include `pending`, `running`, `complete`, `empty`, and `failed: <reason>`. The summary tool `compare.py` reads this to determine completion without incorrectly marking zero-yield runs as "not run" (`N/A`).
+
+## SSE Track Troubleshooting
+
+- **PocketBase 5000-char Limit**: PocketBase normalizes all `text` fields without explicit configuration to a maximum of 5000 characters. To prevent this issue with base64 payloads, use the `json` type which defaults to a max size of 2MB. To apply this, change `type: text` to `type: json` in `setup.sh`, then reset using `docker compose down -v`.
+- **Two-Step Realtime Protocol**: First, open an SSE stream via `GET /api/realtime` to receive a `PB_CONNECT` event with a `clientId`. Then, submit your subscription configuration using a separate `POST /api/realtime` request with that `clientId`.
+- **Verify Schema**: You can quickly verify the schema properties are correct by using `curl -s http://127.0.0.1:8090/api/collections/bench_messages | jq '.fields[] | select(.name=="payload_b64")'`.
+- **Inspect Manifest**: The status of benchmark runs are tracked in `bench/results/run-manifest.json`.
+- **Large-group Scenario**: If the large-group scenario fails due to open HTTP connections hitting limit thresholds, check file descriptor limits with `ulimit -n` and configure via `docker compose` `ulimits` if necessary.

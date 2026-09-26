@@ -116,12 +116,7 @@ PAYLOAD='{
       "system": false,
       "name": "payload_b64",
       "type": "json",
-      "required": true,
-      "presentable": false,
-      "unique": false,
-      "options": {
-        "maxSize": 2000000
-      }
+      "required": true
     }
   ],
   "indexes": [
