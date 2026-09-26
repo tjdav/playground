@@ -96,7 +96,7 @@ for transport in "${TRANSPORTS[@]}"; do
     echo "=== Setting up transport: $transport ==="
     TARGET_ID=""
     if [ "$transport" == "ws" ]; then
-        ./bench/target/release/relay > bench/results/relay.log 2>&1 &
+        RUST_LOG=info ./bench/target/release/relay > bench/relay.log 2>&1 &
         RELAY_PID=$!
         TARGET_ID=$RELAY_PID
         sleep 2
@@ -128,6 +128,13 @@ for transport in "${TRANSPORTS[@]}"; do
             continue
         fi
 
+        if [ "$transport" == "ws" ]; then
+            > bench/relay.log
+        fi
+        if [ ! -f bench/results/run-manifest.json ]; then
+            echo '{"ws":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"},"sse":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"},"sockudo":{"baseline":"pending","small-group":"pending","large-group":"pending","welcome-burst":"pending","mixed":"pending"}}' > bench/results/run-manifest.json
+        fi
+        jq '.[$transport][$scenario] = "running"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
         echo "--- Running scenario: ${scenario} ---"
         rm -f "$OUT_JSON" "$OUT_CSV"
 
@@ -166,8 +173,16 @@ for transport in "${TRANSPORTS[@]}"; do
 
         if [ $GEN_EXIT -ne 0 ]; then
             echo "ERROR: Generator failed for ${transport}-${scenario}"
-            exit 1
+            rm -f "$OUT_JSON"
+            jq '.[$transport][$scenario] = "failed: exit \($GEN_EXIT)"' --arg transport "$transport" --arg scenario "$scenario" --arg GEN_EXIT "$GEN_EXIT" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+        else
+            if [ ! -f "$OUT_JSON" ] || ! grep -q '"latency_us"' "$OUT_JSON"; then
+                jq '.[$transport][$scenario] = "empty"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+            else
+                jq '.[$transport][$scenario] = "complete"' --arg transport "$transport" --arg scenario "$scenario" bench/results/run-manifest.json > bench/results/run-manifest.json.tmp && mv bench/results/run-manifest.json.tmp bench/results/run-manifest.json
+            fi
         fi
+        sync
     done
 
     echo "=== Tearing down transport: $transport ==="

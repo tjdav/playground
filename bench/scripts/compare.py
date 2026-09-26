@@ -30,6 +30,37 @@ def main():
     connection_data = defaultdict(lambda: defaultdict(dict))
     resources_data = defaultdict(dict)
 
+    manifest_path = os.path.join(results_dir, "run-manifest.json")
+    run_manifest = None
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, 'r') as mf:
+                run_manifest = json.load(mf)
+        except json.JSONDecodeError:
+            pass
+
+    if run_manifest is None:
+        print("WARNING: run-manifest.json not found or invalid. Inferring status from files.")
+        run_manifest = defaultdict(dict)
+        for t in transports:
+            for s in scenarios:
+                json_file = os.path.join(results_dir, f"{t}-{s}.jsonl")
+                if os.path.exists(json_file):
+                    # Check if empty
+                    has_latency = False
+                    with open(json_file, 'r') as jf:
+                        for line in jf:
+                            if '"latency_us"' in line:
+                                has_latency = True
+                                break
+                    if has_latency:
+                        run_manifest[t][s] = "complete"
+                    else:
+                        run_manifest[t][s] = "empty"
+                else:
+                    run_manifest[t][s] = "pending"
+
+
     # Track lowest/highest for verdict
     lowest_p95_latency = None # (transport, val)
     highest_completeness = None # (transport, val)
@@ -145,6 +176,17 @@ def main():
 
     with open(md_path, 'w') as f:
         f.write("# Transport Comparison Report\n\n")
+        f.write("## Run Status\n\n")
+        f.write("| Transport | Baseline | Small group | Large group | Welcome burst | Mixed |\n")
+        f.write("|---|---|---|---|---|---|\n")
+        for t in transports:
+            f.write(f"| {t} ")
+            for s in scenarios:
+                status = run_manifest.get(t, {}).get(s, "pending")
+                f.write(f"| {status} ")
+            f.write("|\n")
+        f.write("\n")
+
 
         # Check missing
         missing = False
@@ -164,9 +206,12 @@ def main():
             f.write("|---|---|---|---|---|\n")
 
             for t in transports:
+                status = run_manifest.get(t, {}).get(s, "pending")
                 if t in latency_data.get(s, {}):
                     d = latency_data[s][t]
                     f.write(f"| {t} | {d['p50']:.2f} | {d['p95']:.2f} | {d['p99']:.2f} | {d['max']:.2f} |\n")
+                elif status == "empty" or status.lower() == "empty":
+                    f.write(f"| {t} | EMPTY | EMPTY | EMPTY | EMPTY |\n")
                 else:
                     f.write(f"| {t} | N/A | N/A | N/A | N/A |\n")
             f.write("\n")
@@ -178,8 +223,11 @@ def main():
         for s in scenarios:
             f.write(f"| {s.replace('-', ' ').capitalize()} ")
             for t in transports:
+                status = run_manifest.get(t, {}).get(s, "pending")
                 if t in completeness_data.get(s, {}):
                     f.write(f"| {completeness_data[s][t]:.2f}% ")
+                elif status == "empty" or status.lower() == "empty":
+                    f.write("| EMPTY ")
                 else:
                     f.write("| N/A ")
             f.write("|\n")
@@ -192,9 +240,12 @@ def main():
         for s in scenarios:
             f.write(f"| {s.replace('-', ' ').capitalize()} ")
             for t in transports:
+                status = run_manifest.get(t, {}).get(s, "pending")
                 if t in connection_data.get(s, {}):
                     d = connection_data[s][t]
                     f.write(f"| {d['p50']:.2f} | {d['p95']:.2f} ")
+                elif status == "empty" or status.lower() == "empty":
+                    f.write("| EMPTY | EMPTY ")
                 else:
                     f.write("| N/A | N/A ")
             f.write("|\n")
@@ -205,15 +256,33 @@ def main():
         f.write("|---|---|---|---|\n")
 
         for t in transports:
+            status = run_manifest.get(t, {}).get("large-group", "pending")
             if t in resources_data:
                 d = resources_data[t]
                 f.write(f"| {t} | {d['peak_rss_mb']:.2f} | {d['mean_cpu']:.2f} | {d['peak_fds']} |\n")
+            elif status == "empty" or status.lower() == "empty":
+                f.write(f"| {t} | EMPTY | EMPTY | EMPTY |\n")
             else:
                 f.write(f"| {t} | N/A | N/A | N/A |\n")
         f.write("\n")
 
         # Calculate Verdict
         f.write("## Section 5 — Verdict\n\n")
+
+        transports_with_data = [
+            t for t in ["ws", "sse", "sockudo"]
+            if sum(1 for s in scenarios if t in latency_data.get(s, {})) >= 3
+        ]
+
+        if len(transports_with_data) < 2:
+            verdict = (
+                "**Insufficient data for a verdict.** Only "
+                f"{len(transports_with_data)} transport(s) have data for at least 3 scenarios. "
+                "Complete the matrix and regenerate this report.\n"
+            )
+            f.write(verdict)
+            return
+
 
         # lowest p95 latency
         p95_wins = {t: 0 for t in transports}
@@ -239,10 +308,13 @@ def main():
         highest_comp_t = None
         highest_comp_val = -1
         for t, total in comp_scores.items():
-            avg = total / len(scenarios)
-            if avg > highest_comp_val:
-                highest_comp_val = avg
-                highest_comp_t = t
+            t_scenarios = sum(1 for s in scenarios if t in completeness_data.get(s, {}))
+            if t_scenarios > 0:
+                avg = total / t_scenarios
+                if avg > highest_comp_val:
+                    highest_comp_val = avg
+                    highest_comp_t = t
+
 
         # lowest memory at 500
         lowest_mem_t = None
@@ -274,7 +346,8 @@ def main():
         else:
              f.write(f"{overall_winner.capitalize()} had the lowest p95 latency in {p95_wins[overall_winner]} of {len(scenarios)} scenarios. ")
              if highest_comp_t:
-                 f.write(f"{highest_comp_t.capitalize()} had the highest average delivery completeness ({highest_comp_val:.2f}%). ")
+                 n_scen = sum(1 for s in scenarios if highest_comp_t in completeness_data.get(s, {}))
+                 f.write(f"{highest_comp_t.capitalize()} had the highest average delivery completeness ({highest_comp_val:.2f}%, n={n_scen}). ")
              if lowest_mem_t:
                  diff_percent = 0
                  if 'sse' in resources_data and lowest_mem_t != 'sse':

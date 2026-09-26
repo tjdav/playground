@@ -1,1 +1,10 @@
 /target
+
+# Benchmark outputs
+results/*.jsonl
+results/*.csv
+results/*.log
+results/run-manifest.json
+relay.log
+nohup.out
+*.pid

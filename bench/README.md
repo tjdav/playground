@@ -277,3 +277,11 @@ Run the analysis script just like you would for WebSocket or SSE results, provid
 ```bash
 python3 scripts/analyze.py sockudo-results.jsonl
 ```
+
+## Benchmark Execution
+
+### Log Rotation
+To prevent excessive disk usage, the `run-matrix.sh` runner truncates `relay.log` before each individual scenario on the WS transport track. The relay itself only emits `INFO` level logs by default, which ensures that per-message broadcasts are not logged (they require `DEBUG` level).
+
+### Run Manifest
+The runner natively maintains a JSON state file called `bench/results/run-manifest.json` across all benchmark runs. It logs the individual execution statuses of all 15 permutations (5 scenarios across 3 transports). Potential statuses include `pending`, `running`, `complete`, `empty`, and `failed: <reason>`. The summary tool `compare.py` reads this to determine completion without incorrectly marking zero-yield runs as "not run" (`N/A`).
