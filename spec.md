@@ -1,9 +1,10 @@
+
 # Server Specification v1.0
 
 > **Status:** Frozen — source of truth for all Jules tasks.
 > **Scope:** This document describes the **server-side contract only**. Client implementation is out of scope and will be covered by a separate client specification.
 > **Stack:** Sockudo + Axum + SQLite + OPAQUE + ALTCHA
-> **Deployment:** Single VPS, Docker-based, self-hosted. Two containers: `server` (Axum + static SPA hosting) and `sockudo`.
+> **Deployment:** Single VPS, Docker-based, self-hosted. Two containers: `server` (Axum + static SPA hosting) and `sockudo`. TLS terminates at a reverse proxy (Coolify/Traefik or Caddy).
 
 Any change to this document requires an explicit revision and a corresponding task update. Frozen means: no feature additions, no schema changes, no API surface changes without a spec revision and a documented migration path.
 
@@ -23,6 +24,7 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 | Bot protection | ALTCHA Proof-of-Work v2 via `altcha` 0.2.0 |
 | MLS engine | Wire CoreCrypto 10.5.2 (client-side only) |
 | Static SPA hosting | Axum `ServeDir` with SPA fallback |
+| TLS termination | External reverse proxy (Traefik via Coolify, or Caddy) |
 
 The client is delivered as a separate package (`client/`) and is not covered by this specification.
 
@@ -50,6 +52,7 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Server-side cleanup jobs (sessions, rate limits, audit log, attachments, welcomes)
 - GDPR data subject rights (access, erasure, portability)
 - Static SPA hosting from the same origin as the API
+- HTTPS enforcement via reverse proxy with HSTS
 
 ### 2.2 In Scope — V2
 
@@ -75,6 +78,8 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Client-side data deletion (client responsibility)
 - Forcing peers to delete local message copies (impossible in E2EE)
 - Consent management UI (client responsibility)
+- TLS termination inside the Axum process
+- ACME/Let's Encrypt client inside the server
 
 ---
 
@@ -189,10 +194,12 @@ CLIENT_STATIC_DIR=/app/client
 | Variable | Default | Notes |
 |---|---|---|
 | `APP_ENV` | `production` | `production` or `development` |
-| `APP_URL` | — | **Required.** Public URL of the deployment. |
+| `APP_URL` | — | **Required.** Public URL of the deployment. Must begin with `https://` when `APP_ENV=production`. Server refuses to start otherwise. |
 | `APP_NAME` | `Encrypted Chat` | Display name |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `CLIENT_STATIC_DIR` | — | Optional. When set, Axum serves the SPA from this directory with an SPA fallback. When unset, static serving is disabled (development mode where the Coralite dev server runs separately). |
+
+**Startup validation:** In production, `APP_URL` must start with `https://`. The server exits with a fatal error if the scheme is `http://`. In development, `http://` is permitted.
 
 ### 5.2 Server
 
@@ -268,23 +275,33 @@ RATE_LOGIN_LOCKOUT_MIN=15
 
 Rate limit state is stored in a SQLite table and pruned hourly (entries older than 24 hours).
 
-### 5.7 CORS and CSRF
+### 5.7 Transport Security
 
 ```env
 CORS_ALLOWED_ORIGINS=
 CSRF_PROTECTION=none
+TRUST_PROXY=false
+HSTS_MAX_AGE=31536000
+HSTS_INCLUDE_SUBDOMAINS=true
 ```
 
 | Variable | Default | Notes |
 |---|---|---|
 | `CORS_ALLOWED_ORIGINS` | empty (dev: `*`) | Comma-separated list of allowed origins |
 | `CSRF_PROTECTION` | `none` | `none`, `header`, `double-submit` |
+| `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP`. Set to `true` behind a reverse proxy. |
+| `HSTS_MAX_AGE` | `31536000` | HSTS max-age in seconds (1 year). Set to `0` to disable HSTS. |
+| `HSTS_INCLUDE_SUBDOMAINS` | `true` | Only disable if the domain is shared with non-HTTPS services. |
 
-In production, `CORS_ALLOWED_ORIGINS` must be set. In development, it defaults to `*` with a startup warning.
+**CORS:** In production, `CORS_ALLOWED_ORIGINS` must be set. In development, it defaults to `*` with a startup warning.
 
-CSRF protection is unnecessary for Bearer-token auth. The `CSRF_PROTECTION` variable exists to support future cookie-based sessions. V1 uses `none`.
+**CSRF:** Bearer-token auth does not require CSRF protection. The `CSRF_PROTECTION` variable exists to support future cookie-based sessions. V1 uses `none`.
 
 The server rejects requests with an `Origin` header not in the allowed list, even for non-CORS requests. Origin mismatches are logged at `warn` level.
+
+**Trust proxy:** When `TRUST_PROXY=false`, the server ignores all forwarding headers. This is safe when the server is not behind a proxy, but produces wrong redirects when it is. When `TRUST_PROXY=true`, the server trusts `X-Forwarded-Proto` to determine the client's scheme and `X-Forwarded-For` for IP-based rate limiting.
+
+**HSTS:** Only sent on HTTPS responses. When `HSTS_MAX_AGE=0`, the header is omitted entirely. The `preload` directive is never set — preloading requires submitting the domain to a browser-managed list, which is inappropriate for self-hosted deployments.
 
 ### 5.8 OPAQUE
 
@@ -473,10 +490,18 @@ SOCKUDO_APP_SECRET=auto
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SOCKUDO_URL` | — | **Required.** Sockudo HTTP API base |
+| `SOCKUDO_URL` | — | **Required.** Sockudo HTTP API base. Internal URL; not exposed to clients. |
 | `SOCKUDO_APP_ID` | `chat` | App identifier |
 | `SOCKUDO_APP_KEY` | `auto` | Generated if `auto`, stored in `instance_config` |
 | `SOCKUDO_APP_SECRET` | `auto` | Generated if `auto`, stored in `instance_config` |
+
+The **external** WebSocket URL is derived from `APP_URL`:
+
+```
+wss_url = APP_URL.replace("https://", "wss://") + "/realtime"
+```
+
+Clients connect to the external WSS URL. The reverse proxy terminates TLS and forwards plain WebSocket frames to `SOCKUDO_URL`.
 
 ### 5.18 GDPR
 
@@ -489,6 +514,37 @@ EXPORT_RATE_LIMIT_HOURS=24
 |---|---|---|
 | `DATA_RETENTION_DAYS` | `0` | `0` = retain forever. When set, server-visible message metadata is purged after this window. |
 | `EXPORT_RATE_LIMIT_HOURS` | `24` | Minimum interval between data export requests |
+
+### 5.19 TLS Termination
+
+TLS terminates at a **reverse proxy**, not in the Axum process. The server listens on plain HTTP internally and relies on the proxy to present a valid certificate to clients.
+
+**Coolify deployments:** Traefik is the edge proxy. Certificates are provisioned automatically via Let's Encrypt. No manual TLS configuration is required.
+
+**Manual deployments:** Caddy is the recommended proxy. A minimal `Caddyfile`:
+
+```
+chat.example.com {
+    reverse_proxy server:8080
+    reverse_proxy /realtime* sockudo:6001
+}
+```
+
+Caddy provisions certificates automatically. Nginx and other proxies work equally well but require manual certificate management.
+
+**Client-facing URLs:**
+- The SPA loads from `APP_URL` (HTTPS).
+- API requests go to `APP_URL/api/v1/*` (HTTPS).
+- WebSocket connections go to `wss://<APP_URL host>/realtime` (WSS).
+
+The Axum server never sees the client's TLS connection directly. It sees plain HTTP from the proxy on the internal Docker network.
+
+**What the application enforces:**
+1. `APP_URL` must begin with `https://` when `APP_ENV=production`. Startup fails otherwise.
+2. Requests with `X-Forwarded-Proto: http` are redirected to HTTPS with a 301 when `TRUST_PROXY=true`.
+3. HSTS is sent on HTTPS responses.
+
+See §8.0 for the middleware implementation.
 
 ---
 
@@ -504,15 +560,14 @@ This section describes what the **server requires from clients**. It is not an i
 
 ### 6.2 OPAQUE Handshake Order
 
-- Registration: `POST /auth/register/start` then `POST /auth/register/finish`. The `registration_id` from step one is required in step two.
-- Login: `POST /auth/login/start` then `POST /auth/login/finish`. The `login_id` from step one is required in step two.
+- Registration: `POST /auth/register/start` then `POST /auth/register/finish`.
+- Login: `POST /auth/login/start` then `POST /auth/login/finish`.
 - Clients must complete both rounds within 5 minutes or the correlation state expires.
 
 ### 6.3 ALTCHA Payload Format
 
 - Clients submit a base64-encoded JSON payload in the `altcha` field.
 - The payload is produced by the ALTCHA widget after solving a challenge from `GET /auth/register/challenge`.
-- The server base64-decodes and verifies. Malformed payloads are rejected with `{"error":"invalid_altcha"}`.
 
 ### 6.4 MLS Message Envelope
 
@@ -524,14 +579,13 @@ This section describes what the **server requires from clients**. It is not an i
 
 - Clients encrypt attachments before upload with a per-file ephemeral key.
 - The blob is content-addressed: the SHA-256 of the ciphertext is the blob ID.
-- The ephemeral key and nonce are embedded in the MLS message envelope, not sent to the server separately.
+- The ephemeral key and nonce are embedded in the MLS message envelope.
 - Clients verify the SHA-256 hash of the downloaded blob before decrypting.
 
 ### 6.6 Room Membership
 
 - Room membership is server-visible at the user level (`room_members`).
 - MLS leaf-level membership is client-visible only.
-- The server never knows which MLS leaves correspond to which devices.
 
 ### 6.7 Push Subscriptions
 
@@ -544,9 +598,14 @@ This section describes what the **server requires from clients**. It is not an i
 
 - Clients compute and display safety numbers out-of-band.
 - The server never sees safety numbers.
-- The `safety_number_mode` in `/capabilities` is advisory. Clients decide whether to block or warn.
 
-### 6.9 Client Capability Requirements
+### 6.9 WebSocket Connection
+
+- Clients connect to the URL advertised in `GET /api/v1/capabilities` (`websocket_url`).
+- In production this is always `wss://`.
+- In development this may be `ws://`.
+
+### 6.10 Client Capability Requirements
 
 The server advertises capabilities via `GET /api/v1/capabilities`. Clients must read this on startup and degrade gracefully if a capability is unavailable.
 
@@ -610,7 +669,7 @@ CREATE TABLE sessions (
 
 **Username:** immutable, unique, 3–32 characters, alphanumeric plus underscore and dash.
 
-**Display name:** mutable, 1–64 characters, any printable Unicode. Server-visible. If empty or `NULL`, clients render `username`.
+**Display name:** mutable, 1–64 characters, any printable Unicode. Server-visible.
 
 **`deleted_at`:** Set when the user requests account deletion. The row is anonymised but retained for referential integrity.
 
@@ -760,9 +819,7 @@ CREATE UNIQUE INDEX idx_push_browser ON push_subscriptions(user_id, browser_id)
 
 **Platform separation:** Web, iOS, Android, and desktop are separate rows.
 
-**Per-browser instance:** A single device can have multiple web subscriptions (Chrome, Firefox, Safari). Each is a separate row keyed on `(user_id, browser_id)`.
-
-**Cleanup:** Subscriptions where `revoked_at IS NOT NULL AND revoked_at < now() - 30 days` are deleted by the hourly cleanup job.
+**Per-browser instance:** A single device can have multiple web subscriptions (Chrome, Firefox, Safari).
 
 ### 7.7 Instance Config & Ops
 
@@ -833,9 +890,11 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 }
 ```
 
-### 8.0 Static Client Hosting
+### 8.0 Static Client Hosting and HTTPS Enforcement
 
-When `CLIENT_STATIC_DIR` is set, the Axum server serves the compiled Coralite SPA from that directory using `ServeDir` with an SPA fallback. Requests that do not match an API route fall through to the SPA:
+#### Static SPA Hosting
+
+When `CLIENT_STATIC_DIR` is set, the Axum server serves the compiled Coralite SPA from that directory using `ServeDir` with an SPA fallback:
 
 ```rust
 let spa = ServeDir::new(&config.client_static_dir)
@@ -846,12 +905,89 @@ let app = Router::new()
     .route("/health", get(health))
     .route("/ready", get(ready))
     .fallback_service(spa)
+    .layer(middleware::from_fn_with_state(state.clone(), enforce_https))
     .with_state(state);
 ```
 
 The `fallback_service` runs last. API routes and health checks are matched first. Deep links return `index.html` and the client-side router takes over.
 
 In development (`CLIENT_STATIC_DIR` unset), static serving is disabled and the Coralite dev server runs separately on port 3000.
+
+#### HTTPS Enforcement
+
+When `APP_ENV=production`, a middleware layer enforces HTTPS semantics:
+
+```rust
+async fn enforce_https(
+    State(config): State<Arc<Config>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let is_prod = config.app_env == "production";
+
+    if !is_prod {
+        return next.run(req).await;
+    }
+
+    // Health and readiness are exempt — orchestrators probe over plain HTTP.
+    let path = req.uri().path();
+    if path == "/health" || path == "/ready" {
+        return next.run(req).await;
+    }
+
+    let scheme = if config.trust_proxy {
+        req.headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("https")
+    } else {
+        "https"  // no proxy trusted; assume proxy terminated TLS correctly
+    };
+
+    if scheme == "http" {
+        let location = format!(
+            "{}{}",
+            config.app_url,
+            req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
+        );
+        return Response::builder()
+            .status(StatusCode::MOVED_PERMANENTLY)
+            .header("Location", location)
+            .body(Body::empty())
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
+    let mut response = next.run(req).await;
+
+    if config.hsts_max_age > 0 {
+        let mut hsts = format!("max-age={}", config.hsts_max_age);
+        if config.hsts_include_subdomains {
+            hsts.push_str("; includeSubDomains");
+        }
+        if let Ok(value) = HeaderValue::from_str(&hsts) {
+            response.headers_mut().insert(
+                HeaderName::from_static("strict-transport-security"),
+                value,
+            );
+        }
+    }
+
+    response
+}
+```
+
+**Behaviour summary:**
+
+- In development, no redirect, no HSTS.
+- In production with `TRUST_PROXY=true`, requests with `X-Forwarded-Proto: http` get a 301 redirect to the HTTPS URL.
+- In production with `TRUST_PROXY=false`, the server assumes the proxy is doing its job and does not redirect. A startup warning is logged if `TRUST_PROXY=false` in production.
+- `/health` and `/ready` are exempt — they are probed over plain HTTP by orchestrators on the internal network.
+
+**Reverse proxy requirement:** The reverse proxy MUST be configured to:
+1. Terminate TLS with a valid certificate.
+2. Set `X-Forwarded-Proto: https` on requests it forwards.
+3. Proxy `/api/*` and static assets to the Axum server on port 8080.
+4. Proxy `/realtime` (WebSocket) to Sockudo.
 
 ### 8.1 Public
 
@@ -867,6 +1003,28 @@ In development (`CLIENT_STATIC_DIR` unset), static serving is disabled and the C
 | POST | `/auth/login/finish` | OPAQUE login finish → session token |
 | POST | `/invites/redeem` | Validate and consume a server invite |
 | GET | `/invites/:code` | Public invite code validation |
+
+**`GET /capabilities` response:**
+
+```json
+{
+  "version": "0.1.0",
+  "calling": false,
+  "push_vapid_public_key": null,
+  "websocket_url": "wss://chat.example.com/realtime",
+  "altcha": {
+    "enabled": true,
+    "algorithm": "PBKDF2/SHA-256",
+    "cost": 5000
+  },
+  "safety_number_mode": "warn",
+  "moderation_mode": "messenger"
+}
+```
+
+The `websocket_url` is derived from `APP_URL`:
+- Production: `APP_URL` with `https://` replaced by `wss://`, plus `/realtime`.
+- Development: `ws://localhost:6001` or the value of `SOCKUDO_PUBLIC_URL` if set.
 
 ### 8.2 User
 
@@ -976,6 +1134,8 @@ This matrix describes **server behaviour** for features the client relies on. Cl
 | Calling (V2) | Advertised as `calling: false` in `/capabilities` |
 | Data export | Returns ZIP of ciphertext and account metadata |
 | Account deletion | Anonymises user record; cascades session, device, KeyPackage, MLS Remove |
+| WebSocket | Advertised as `wss://` in production, `ws://` in development |
+| HTTPS | Enforced by reverse proxy; server redirects and sends HSTS |
 
 ---
 
@@ -994,6 +1154,7 @@ This matrix describes **server behaviour** for features the client relies on. Cl
 | 6a | Instance config, limits, audit log, readiness | 4a |
 | 6b | Cleanup scheduler + jobs | 6a |
 | 6c | Account deletion + data export (GDPR) | 6a |
+| 6d | HTTPS enforcement + static SPA hosting | 6a |
 | 7 | Room CRUD + membership + ownership transfer | 5 |
 | 8 | Room invites | 7 |
 | 9 | KeyPackage upload, claim, quota enforcement | 7 |
@@ -1030,6 +1191,9 @@ This matrix describes **server behaviour** for features the client relies on. Cl
 | Registration endpoints are bot-resistant | Yes. ALTCHA PoW v2 in deterministic mode. |
 | Registration endpoints use third-party CAPTCHA | Never. ALTCHA is fully self-hosted. |
 | Server can force peers to delete local copies | No. Tombstones are advisory. |
+| Production traffic is HTTPS | Yes. Enforced by reverse proxy with HSTS. |
+| HTTP is permitted in production | No. `APP_URL` must use `https://`; server refuses to start otherwise. |
+| TLS terminates inside the Axum process | No. Terminates at reverse proxy. |
 
 ---
 
@@ -1066,94 +1230,84 @@ The controller (the person running the instance) is responsible for responding t
 
 ```json
 {
-  "confirm": "DELETE",
-  "password": "<OPAQUE password for verification>"
+  "confirm": "DELETE"
 }
 ```
 
-**Behavior:**
+**Preconditions:**
 
-1. Re-authenticate via OPAQUE. Deletion requires password confirmation.
-2. In a single transaction:
-   - Delete all sessions for the user.
-   - Delete all devices for the user (cascades sessions).
-   - Delete all unconsumed KeyPackages for the user.
-   - Queue MLS Removes for every room the user is a member of.
-   - Delete all push subscriptions for the user.
-   - Delete the `recovery_vault` record if it exists.
-   - Anonymise the user row:
-     - `username = "deleted_<random>"`
-     - `username_hash = <random>`
-     - `display_name = NULL`
-     - `profile_blob = NULL`
-     - `opaque_registration = <random 32 bytes>`
-     - `identity_pubkey = ""`
-     - `disabled_at = now()`
-     - `deleted_at = now()`
-3. Log an audit entry with action `user.delete`.
-4. Return HTTP 204.
+- Session must have been created within the last 5 minutes.
+- `confirm` must exactly equal `"DELETE"`.
+- User must not be the last user with the `owner` role.
 
-**Why anonymise instead of hard delete:** `users.id` is referenced by `messages.sender_id`, `attachments.uploader_id`, and `room_members.user_id`. Hard deletion cascades and destroys data other users still need. Anonymisation preserves referential integrity while removing all personal data.
+**Behavior:** Single transaction that:
+
+1. Deletes all unconsumed KeyPackages.
+2. Deletes all push subscriptions.
+3. Queues MLS Removes for every room the user is a member of.
+4. Deletes the `recovery_vault` record if it exists.
+5. Deletes all devices (cascades sessions).
+6. Deletes any remaining sessions without a device.
+7. Anonymises the user row:
+   - `username = "deleted_<random>"`
+   - `username_hash = <random>`
+   - `display_name = NULL`
+   - `profile_blob = NULL`
+   - `opaque_registration = <random 32 bytes>`
+   - `identity_pubkey = ""`
+   - `max_file_size_bytes = NULL`
+   - `disabled_at = now()`
+   - `deleted_at = now()`
+8. Removes all room memberships.
+9. Writes an audit entry with action `user.delete`.
+
+Returns HTTP 204.
+
+**Why anonymise:** `users.id` is referenced by messages, attachments, and room memberships. Hard delete cascades and destroys other users' data. Anonymisation removes personal data while preserving referential integrity.
 
 ### 14.3 Data Export — `GET /api/v1/users/me/export`
 
-Returns a ZIP archive:
+Returns a ZIP archive with:
 
 | File | Contents |
 |---|---|
 | `profile.json` | Username, display name, created_at, roles |
-| `devices.json` | Device list with client IDs and names |
-| `rooms.json` | Room membership with join dates |
-| `messages.json` | All server-visible message metadata (ciphertext, epoch, coarsened timestamps) |
+| `devices.json` | Device list |
 | `sessions.json` | Session history |
+| `rooms.json` | Room membership |
+| `messages.json` | Server-visible message metadata (ciphertext) |
 | `audit.json` | Audit entries where the user is the actor |
-| `README.txt` | Format documentation and limitation notes |
+| `README.txt` | Format documentation and ciphertext limitation |
 
-**Limitation:** The export contains ciphertext, not plaintext. The server cannot decrypt. The export is useful for the user's own records but requires the user's MLS keys to be read.
+**Limitation:** The export contains ciphertext, not plaintext. The server cannot decrypt.
 
-**Rate limit:** One export per user per `EXPORT_RATE_LIMIT_HOURS` (default 24).
+**Rate limit:** One export per `EXPORT_RATE_LIMIT_HOURS` (default 24).
 
 ### 14.4 Retention Policy
 
-Instance config key `DATA_RETENTION_DAYS` (env: `DATA_RETENTION_DAYS`, default `0` = forever). When set:
-
-- Sessions older than the retention window are purged.
-- Audit log entries older than `AUDIT_RETENTION_DAYS` are purged (already implemented).
-- Message history older than the retention window is purged from Sockudo history (Phase 10/12).
-- Attachments older than the retention window are purged (Phase 12).
+Instance config `DATA_RETENTION_DAYS` (default `0` = forever). When set, sessions, messages, and attachments older than the window are purged.
 
 ### 14.5 Tombstone Semantics
 
-When a user deletes a message:
-
-1. Client sends an MLS application message with `{"type":"tombstone","target_message_id":"..."}`.
-2. All clients mark the local message as deleted and render a tombstone.
-3. Server deletes its copy of the ciphertext from Sockudo history.
-4. Server cannot force peers to delete local copies. This is documented as a known limitation.
-
-**Server obligation:** Deleting the ciphertext from Sockudo history and the database satisfies Art. 17 obligations for the controller's own storage. Peer deletion is advisory.
+Deleted messages are tombstoned. The server deletes its copy from Sockudo history. Peers receive a tombstone and delete their local copy if their client honours it. The server cannot force peer deletion.
 
 ### 14.6 Metadata Minimisation
 
-| Field | Current | Minimisation |
-|---|---|---|
-| `devices.client_id` | Random 128-bit, client-generated | Keep — not a hardware identifier |
-| `sessions.last_seen_at` | Timestamp | Coarsen to hour |
-| `messages.created_at` | Timestamp | Coarsen to minute |
-| `audit_log.actor_id` | User ID | Keep — required for audit |
-| `audit_log.metadata` | JSON | Never include message content or IPs |
-| IP addresses | Not stored in schema | Ensure logs are rotated and not persisted indefinitely |
+| Field | Minimisation |
+|---|---|
+| `devices.client_id` | Random 128-bit, not a hardware identifier |
+| `sessions.last_seen_at` | Coarsened to hour |
+| `messages.created_at` | Coarsened to minute |
+| `audit_log.metadata` | Never includes content or IPs |
+| IP addresses | Not stored in schema; logs rotated |
 
 ### 14.7 Controller Obligations
 
 The controller is responsible for:
 
 - Publishing a privacy policy
-- Providing a DPA (Data Processing Agreement) to users if they are a business
-- Documenting where data is hosted (server location)
-- Documenting sub-processors (Sockudo if hosted separately, backup storage provider if S3)
-
-The software provides the technical mechanisms. Legal obligations rest with the controller.
+- Providing a DPA if operating commercially
+- Documenting server location and sub-processors
 
 ### 14.8 Audit Actions
 
