@@ -1,8 +1,9 @@
-# Application Specification v1.0
+# Server Specification v1.0
 
 > **Status:** Frozen — source of truth for all Jules tasks.
-> **Stack:** Sockudo + Axum + SQLite + Wire CoreCrypto + Coralite + Tauri
-> **Deployment:** Single VPS, Docker-based, self-hosted.
+> **Scope:** This document describes the **server-side contract only**. Client implementation is out of scope and will be covered by a separate client specification.
+> **Stack:** Sockudo + Axum + SQLite + OPAQUE + ALTCHA
+> **Deployment:** Single VPS, Docker-based, self-hosted. Two containers: `server` (Axum + static SPA hosting) and `sockudo`.
 
 Any change to this document requires an explicit revision and a corresponding task update. Frozen means: no feature additions, no schema changes, no API surface changes without a spec revision and a documented migration path.
 
@@ -10,7 +11,7 @@ Any change to this document requires an explicit revision and a corresponding ta
 
 ## 1. Product Summary
 
-A self-hosted, end-to-end encrypted group messaging system with MLS-grade forward secrecy and post-compromise security. Clients run in browsers (WASM), on mobile (Capacitor), and on desktop (Tauri). The server is an untrusted delivery service that never sees plaintext, keys, or meaningful metadata.
+A self-hosted, end-to-end encrypted group messaging system with MLS-grade forward secrecy and post-compromise security. The server is an untrusted delivery service that never sees plaintext, keys, or meaningful metadata.
 
 | Layer | Technology |
 |---|---|
@@ -18,11 +19,12 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 | API | Axum (Rust) |
 | Database | SQLite (embedded in the Axum process) |
 | Blob storage | Filesystem or S3 (content-addressed) |
-| MLS engine | Wire CoreCrypto 10.5.2 |
 | Auth | OPAQUE (aPAKE) via `opaque-ke` 4.0.1 |
 | Bot protection | ALTCHA Proof-of-Work v2 via `altcha` 0.2.0 |
-| Frontend | Coralite |
-| Desktop | Tauri |
+| MLS engine | Wire CoreCrypto 10.5.2 (client-side only) |
+| Static SPA hosting | Axum `ServeDir` with SPA fallback |
+
+The client is delivered as a separate package (`client/`) and is not covered by this specification.
 
 ---
 
@@ -35,7 +37,6 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 - ALTCHA proof-of-work bot protection on registration
 - Multi-device support (default 10 devices per user)
 - Rooms as the unit of conversation (1:1 = 2-member room)
-- MLS group key agreement via Wire CoreCrypto
 - Text messaging with read receipts and typing indicators
 - Message deletion (tombstone; no editing)
 - Encrypted attachments with configurable size limits
@@ -47,6 +48,8 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 - Three-tier resource limits (server / instance / entity)
 - Display name separate from immutable username
 - Server-side cleanup jobs (sessions, rate limits, audit log, attachments, welcomes)
+- GDPR data subject rights (access, erasure, portability)
+- Static SPA hosting from the same origin as the API
 
 ### 2.2 In Scope — V2
 
@@ -68,7 +71,10 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 - Anonymous accounts
 - Plaintext message export
 - Username changes (usernames are immutable)
-- Third-party CAPTCHA services (reCAPTCHA, hCaptcha, Turnstile)
+- Third-party CAPTCHA services
+- Client-side data deletion (client responsibility)
+- Forcing peers to delete local message copies (impossible in E2EE)
+- Consent management UI (client responsibility)
 
 ---
 
@@ -162,6 +168,7 @@ All cleanup jobs run on a shared hourly scheduler.
 | Welcome expiry | 7 days | Stale welcomes deleted; room admin must re-issue |
 | Message retention | Per-room `retention_days`, falling to instance default | Deletes messages from Sockudo history and DB references |
 | Registration state | 5-minute TTL, purged opportunistically on insert | In-memory only, lost on restart |
+| Login state | 5-minute TTL, purged opportunistically on insert | In-memory only, lost on restart |
 
 ---
 
@@ -176,6 +183,7 @@ APP_ENV=production
 APP_URL=https://chat.example.com
 APP_NAME=Encrypted Chat
 LOG_LEVEL=info
+CLIENT_STATIC_DIR=/app/client
 ```
 
 | Variable | Default | Notes |
@@ -184,6 +192,7 @@ LOG_LEVEL=info
 | `APP_URL` | — | **Required.** Public URL of the deployment. |
 | `APP_NAME` | `Encrypted Chat` | Display name |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
+| `CLIENT_STATIC_DIR` | — | Optional. When set, Axum serves the SPA from this directory with an SPA fallback. When unset, static serving is disabled (development mode where the Coralite dev server runs separately). |
 
 ### 5.2 Server
 
@@ -378,8 +387,8 @@ ALTCHA_COST=5000
 |---|---|---|
 | `ALTCHA_ENABLED` | `true` | Master switch. When `false`, the challenge endpoint returns 404 and registration skips validation. |
 | `ALTCHA_HMAC_SECRET` | `auto` | Generated on first startup and stored in `instance_config` under `altcha_hmac_secret`. |
-| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | KDF algorithm. Use only algorithms supported by the `altcha` crate. |
-| `ALTCHA_COST` | `5000` | KDF iteration count. Higher = more client work, same server cost. |
+| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | KDF algorithm. |
+| `ALTCHA_COST` | `5000` | KDF iteration count. |
 
 **Crate:** `altcha` 0.2.0 or later. Version 0.1.0 is not permitted.
 
@@ -387,11 +396,9 @@ ALTCHA_COST=5000
 
 **Purpose:** ALTCHA provides bot resistance on registration endpoints without third-party services, user tracking, or image puzzles. It is a validation layer that runs before the OPAQUE handshake. It does not modify the OPAQUE protocol.
 
-**Protection scope:** ALTCHA protects `POST /api/v1/auth/register/start` and `POST /api/v1/auth/register/finish`. It does not protect login (Phase 3b), invite redemption (Phase 5), or any other endpoint.
+**Protection scope:** ALTCHA protects `POST /api/v1/auth/register/start` and `POST /api/v1/auth/register/finish`. It does not protect login, invite redemption, or any other endpoint.
 
-**Client integration:** The frontend embeds the `<altcha-widget>` web component and points it at `GET /api/v1/auth/register/challenge`. The widget solves the challenge in a Web Worker and populates a hidden `altcha` input with the base64-encoded JSON payload.
-
-**Secret persistence:** The HMAC secret is stored in `instance_config`. Loss of the secret invalidates in-flight challenges only — no persistent state depends on it. Challenge rotation is safe at any time.
+**Secret persistence:** The HMAC secret is stored in `instance_config`. Loss of the secret invalidates in-flight challenges only — no persistent state depends on it.
 
 ### 5.12 Moderation
 
@@ -409,13 +416,17 @@ MODERATION_MODE=messenger
 INVITE_DEFAULT_USES=1
 INVITE_EXPIRY_DAYS=0
 INVITE_CODE_LENGTH=8
+INVITE_LIMITED_MAX_USES=10
+INVITE_LIMITED_MAX_OPEN=50
 ```
 
 | Variable | Default | Notes |
 |---|---|---|
 | `INVITE_DEFAULT_USES` | `1` | `0` = unlimited |
 | `INVITE_EXPIRY_DAYS` | `0` | `0` = never expires |
-| `INVITE_CODE_LENGTH` | `8` | Base32 length |
+| `INVITE_CODE_LENGTH` | `8` | Crockford Base32 length |
+| `INVITE_LIMITED_MAX_USES` | `10` | Max `max_uses` for `invite.limited` users |
+| `INVITE_LIMITED_MAX_OPEN` | `50` | Max open invites for `invite.limited` users |
 
 ### 5.14 Safety Numbers
 
@@ -435,9 +446,23 @@ AUDIT_RETENTION_DAYS=90
 
 | Variable | Default | Notes |
 |---|---|---|
-| `AUDIT_RETENTION_DAYS` | `90` | Entries older than this are pruned daily |
+| `AUDIT_RETENTION_DAYS` | `90` | Entries older than this are pruned daily. `0` disables pruning. |
 
-### 5.16 Sockudo
+### 5.16 Cleanup Scheduler
+
+```env
+CLEANUP_ENABLED=true
+CLEANUP_INTERVAL_MINUTES=60
+CLEANUP_STARTUP_DELAY_SECS=30
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CLEANUP_ENABLED` | `true` | Master switch |
+| `CLEANUP_INTERVAL_MINUTES` | `60` | Cycle interval |
+| `CLEANUP_STARTUP_DELAY_SECS` | `30` | Delay before first cycle |
+
+### 5.17 Sockudo
 
 ```env
 SOCKUDO_URL=http://sockudo:6001
@@ -453,34 +478,77 @@ SOCKUDO_APP_SECRET=auto
 | `SOCKUDO_APP_KEY` | `auto` | Generated if `auto`, stored in `instance_config` |
 | `SOCKUDO_APP_SECRET` | `auto` | Generated if `auto`, stored in `instance_config` |
 
-If the credentials are missing from `instance_config` but Sockudo is reachable, the server refuses to start and logs an error directing the operator to complete setup.
+### 5.18 GDPR
+
+```env
+DATA_RETENTION_DAYS=0
+EXPORT_RATE_LIMIT_HOURS=24
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DATA_RETENTION_DAYS` | `0` | `0` = retain forever. When set, server-visible message metadata is purged after this window. |
+| `EXPORT_RATE_LIMIT_HOURS` | `24` | Minimum interval between data export requests |
 
 ---
 
-## 6. Client Storage Model
+## 6. Client Interface Contract
 
-### 6.1 Native (iOS, Android, Tauri)
+This section describes what the **server requires from clients**. It is not an implementation guide. Client code lives in `client/` and has its own specification.
 
-- **Database:** SQLCipher with key from Secure Enclave (iOS), Keystore (Android), or OS keychain (Tauri).
-- **MLS state:** Stored in SQLCipher. CoreCrypto manages its own encrypted state.
-- **Identity key:** Wrapped by hardware-backed keystore.
+### 6.1 Authentication
 
-### 6.2 Web (Browser)
+- Clients send `Authorization: Bearer <session_token>` on every authenticated request.
+- The session token is obtained from `POST /api/v1/auth/login/finish`.
+- Tokens are 43-character base64url strings. Clients must not parse or modify them.
 
-- **Database:** WASM SQLite (`wa-sqlite` or `@sqlite.org/sqlite-wasm`), unencrypted at the SQL layer.
-- **Encryption model:** Application-layer. All sensitive blobs (identity key, MLS state, wrapped recovery key, message plaintext cache) are encrypted with WebCrypto before write.
-- **CoreCrypto database key:** Derived from the OPAQUE session key via HKDF. Cached in memory for the session lifetime. Never persisted.
-- **Persistence:** OPFS preferred, IndexedDB fallback.
-- **Rationale:** SQLCipher does not compile to WASM. Application-layer encryption provides equivalent security because everything sensitive is already ciphertext before touching disk.
+### 6.2 OPAQUE Handshake Order
 
-### 6.3 Local Key Derivation (Web)
+- Registration: `POST /auth/register/start` then `POST /auth/register/finish`. The `registration_id` from step one is required in step two.
+- Login: `POST /auth/login/start` then `POST /auth/login/finish`. The `login_id` from step one is required in step two.
+- Clients must complete both rounds within 5 minutes or the correlation state expires.
 
-```
-session_key = OPAQUE session key (32 bytes, from login)
-db_key      = HKDF-SHA256(session_key, salt="mls-db-v1", info="corecrypto-db")
-```
+### 6.3 ALTCHA Payload Format
 
-`db_key` is held in a JavaScript `Uint8Array`, cleared with `.fill(0)` on logout or session expiry.
+- Clients submit a base64-encoded JSON payload in the `altcha` field.
+- The payload is produced by the ALTCHA widget after solving a challenge from `GET /auth/register/challenge`.
+- The server base64-decodes and verifies. Malformed payloads are rejected with `{"error":"invalid_altcha"}`.
+
+### 6.4 MLS Message Envelope
+
+- Clients encrypt and decrypt MLS messages locally. The server never inspects MLS state.
+- Message payloads are base64-encoded MLS ciphertexts.
+- Padding to fixed buckets (256 B, 1 KB, 4 KB, 16 KB) is a client responsibility.
+
+### 6.5 Attachments
+
+- Clients encrypt attachments before upload with a per-file ephemeral key.
+- The blob is content-addressed: the SHA-256 of the ciphertext is the blob ID.
+- The ephemeral key and nonce are embedded in the MLS message envelope, not sent to the server separately.
+- Clients verify the SHA-256 hash of the downloaded blob before decrypting.
+
+### 6.6 Room Membership
+
+- Room membership is server-visible at the user level (`room_members`).
+- MLS leaf-level membership is client-visible only.
+- The server never knows which MLS leaves correspond to which devices.
+
+### 6.7 Push Subscriptions
+
+- Clients register push subscriptions via `POST /users/me/push-subscriptions`.
+- The `platform` field must be one of `web`, `ios`, `android`, `desktop`.
+- Web Push subscriptions include `endpoint`, `p256dh`, `auth`, and `browser_id`.
+- Native subscriptions include `push_token` only.
+
+### 6.8 Safety Numbers
+
+- Clients compute and display safety numbers out-of-band.
+- The server never sees safety numbers.
+- The `safety_number_mode` in `/capabilities` is advisory. Clients decide whether to block or warn.
+
+### 6.9 Client Capability Requirements
+
+The server advertises capabilities via `GET /api/v1/capabilities`. Clients must read this on startup and degrade gracefully if a capability is unavailable.
 
 ---
 
@@ -500,7 +568,8 @@ CREATE TABLE users (
     profile_version     INTEGER NOT NULL DEFAULT 1,
     max_file_size_bytes INTEGER,
     created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    disabled_at         DATETIME
+    disabled_at         DATETIME,
+    deleted_at          DATETIME
 );
 
 CREATE TABLE roles (
@@ -528,23 +597,22 @@ CREATE TABLE devices (
 );
 
 CREATE TABLE sessions (
-    id          TEXT PRIMARY KEY,
-    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_id   TEXT REFERENCES devices(id) ON DELETE CASCADE,
-    token_hash  TEXT NOT NULL UNIQUE,
-    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at  DATETIME NOT NULL,
-    revoked_at  DATETIME
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id    TEXT REFERENCES devices(id) ON DELETE CASCADE,
+    token_hash   TEXT NOT NULL UNIQUE,
+    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at   DATETIME NOT NULL,
+    revoked_at   DATETIME,
+    last_seen_at DATETIME
 );
 ```
 
-**Username:** immutable, unique, 3–32 characters, alphanumeric plus underscore and dash. Used as the lookup key for room membership.
+**Username:** immutable, unique, 3–32 characters, alphanumeric plus underscore and dash.
 
-**Display name:** mutable, 1–64 characters, any printable Unicode. Server-visible (so push notifications can include it). If empty or `NULL`, clients render `username`.
+**Display name:** mutable, 1–64 characters, any printable Unicode. Server-visible. If empty or `NULL`, clients render `username`.
 
-**`opaque_registration`:** serialized `ServerRegistration<DefaultCipherSuite>` produced by the OPAQUE registration handshake. Binary format bound to the `opaque-ke` version and cipher suite documented in §5.8.
-
-**`profile_blob`:** E2E encrypted. Contains bio, avatar URL, and any other private profile metadata. The server never sees its contents.
+**`deleted_at`:** Set when the user requests account deletion. The row is anonymised but retained for referential integrity.
 
 ### 7.2 Invites
 
@@ -552,7 +620,7 @@ CREATE TABLE sessions (
 CREATE TABLE server_invites (
     id            TEXT PRIMARY KEY,
     code          TEXT NOT NULL UNIQUE,
-    created_by    TEXT NOT NULL REFERENCES users(id),
+    created_by    TEXT REFERENCES users(id),
     max_uses      INTEGER NOT NULL,
     current_uses  INTEGER NOT NULL DEFAULT 0,
     expires_at    DATETIME,
@@ -636,9 +704,20 @@ CREATE TABLE welcomes (
 
 CREATE INDEX idx_welcome_pending ON welcomes(recipient_user_id, consumed)
     WHERE consumed = 0;
-```
 
-Welcomes expire 7 days after creation.
+CREATE TABLE pending_mls_removes (
+    id               TEXT PRIMARY KEY,
+    room_id          TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    target_user_id   TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_client_id TEXT NOT NULL,
+    queued_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    consumed_at      DATETIME
+);
+
+CREATE INDEX idx_pending_mls_removes_active
+    ON pending_mls_removes(room_id, consumed_at)
+    WHERE consumed_at IS NULL;
+```
 
 ### 7.5 Attachments
 
@@ -679,11 +758,7 @@ CREATE UNIQUE INDEX idx_push_browser ON push_subscriptions(user_id, browser_id)
     WHERE browser_id IS NOT NULL;
 ```
 
-**Platform separation:** Web, iOS, Android, and desktop are separate rows. Each uses a different transport.
-
-- **Web rows** populate `endpoint`, `p256dh`, `auth`, `browser_id`. `push_token` is `NULL`.
-- **iOS/Android rows** populate `push_token`. `endpoint`, `p256dh`, `auth`, `browser_id` are `NULL`.
-- **Desktop rows** may use a native OS token or IPC channel.
+**Platform separation:** Web, iOS, Android, and desktop are separate rows.
 
 **Per-browser instance:** A single device can have multiple web subscriptions (Chrome, Firefox, Safari). Each is a separate row keyed on `(user_id, browser_id)`.
 
@@ -732,11 +807,7 @@ CREATE TABLE rate_limits (
 );
 ```
 
-`instance_config` stores VAPID keys, Sockudo credentials, the ALTCHA HMAC secret, and any other auto-generated per-instance secrets.
-
 ### 7.8 State Outside the Database
-
-Not all persistent state lives in SQLite. The following files must be preserved across restarts and included in backups:
 
 | Path | Purpose | Notes |
 |---|---|---|
@@ -744,7 +815,7 @@ Not all persistent state lives in SQLite. The following files must be preserved 
 | `BACKUP_PATH` | Backup snapshots | Populated by the backup scheduler |
 | Blob storage root | Encrypted attachment blobs | Content-addressed; filesystem or S3 |
 
-The OPAQUE `ServerSetup` file must have `0600` permissions on Unix. It must be readable only by the server process.
+The OPAQUE `ServerSetup` file must have `0600` permissions on Unix.
 
 ---
 
@@ -762,53 +833,57 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 }
 ```
 
-`error` is a stable machine-readable code. `message` is human-readable. `details` is optional and used for field-level validation errors.
+### 8.0 Static Client Hosting
+
+When `CLIENT_STATIC_DIR` is set, the Axum server serves the compiled Coralite SPA from that directory using `ServeDir` with an SPA fallback. Requests that do not match an API route fall through to the SPA:
+
+```rust
+let spa = ServeDir::new(&config.client_static_dir)
+    .not_found_service(ServeFile::new(format!("{}/index.html", config.client_static_dir)));
+
+let app = Router::new()
+    .nest("/api/v1", api_routes)
+    .route("/health", get(health))
+    .route("/ready", get(ready))
+    .fallback_service(spa)
+    .with_state(state);
+```
+
+The `fallback_service` runs last. API routes and health checks are matched first. Deep links return `index.html` and the client-side router takes over.
+
+In development (`CLIENT_STATIC_DIR` unset), static serving is disabled and the Coralite dev server runs separately on port 3000.
 
 ### 8.1 Public
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | Liveness. Returns 200 if process is alive. Never touches DB. |
-| GET | `/ready` | Readiness. Checks DB connectivity, OPRF key loaded, Sockudo reachable. |
-| GET | `/capabilities` | Feature + VAPID public key + ALTCHA status advertisement |
-| GET | `/auth/register/challenge` | ALTCHA challenge for registration. Returns 404 when `ALTCHA_ENABLED=false`. |
-| POST | `/auth/register/start` | OPAQUE registration start. Requires ALTCHA payload when enabled. |
-| POST | `/auth/register/finish` | OPAQUE registration finish. Requires ALTCHA payload when enabled. Requires invite code if users exist. |
+| GET | `/health` | Liveness |
+| GET | `/ready` | Readiness |
+| GET | `/capabilities` | Feature advertisement |
+| GET | `/auth/register/challenge` | ALTCHA challenge |
+| POST | `/auth/register/start` | OPAQUE registration start |
+| POST | `/auth/register/finish` | OPAQUE registration finish |
 | POST | `/auth/login/start` | OPAQUE login start |
 | POST | `/auth/login/finish` | OPAQUE login finish → session token |
 | POST | `/invites/redeem` | Validate and consume a server invite |
-
-**`GET /capabilities` response includes:**
-
-```json
-{
-  "version": "0.1.0",
-  "calling": false,
-  "push_vapid_public_key": null,
-  "altcha": {
-    "enabled": true,
-    "algorithm": "PBKDF2/SHA-256",
-    "cost": 5000
-  },
-  "safety_number_mode": "warn",
-  "moderation_mode": "messenger"
-}
-```
+| GET | `/invites/:code` | Public invite code validation |
 
 ### 8.2 User
 
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/auth/logout` | Revoke session |
-| GET | `/users/me` | Current user (includes `display_name`) |
-| PATCH | `/users/me` | Update `display_name` and/or `profile_blob`. Rejects `username`. |
+| GET | `/users/me` | Current user |
+| PATCH | `/users/me` | Update profile |
+| DELETE | `/users/me` | Delete account (GDPR Art. 17) |
+| GET | `/users/me/export` | Export data (GDPR Art. 20) |
 | POST | `/users/lookup` | Exact username_hash lookup |
 | GET | `/users/me/devices` | List devices |
-| DELETE | `/users/me/devices/:id` | Revoke device (cascades: sessions, KeyPackages, MLS Remove) |
+| DELETE | `/users/me/devices/:id` | Revoke device |
 | GET | `/users/me/sessions` | List sessions |
 | DELETE | `/users/me/sessions/:id` | Revoke session |
-| POST | `/users/me/push-subscriptions` | Register a push subscription |
-| DELETE | `/users/me/push-subscriptions/:id` | Revoke a push subscription |
+| POST | `/users/me/push-subscriptions` | Register push subscription |
+| DELETE | `/users/me/push-subscriptions/:id` | Revoke push subscription |
 
 ### 8.3 Admin
 
@@ -829,7 +904,7 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 | GET | `/admin/audit` | Read audit log |
 | GET | `/admin/backups` | List backups |
 | POST | `/admin/backups` | Trigger manual backup |
-| POST | `/admin/vapid/rotate` | Rotate VAPID keys (revokes all push subscriptions) |
+| POST | `/admin/vapid/rotate` | Rotate VAPID keys |
 | POST | `/admin/altcha/rotate` | Rotate ALTCHA HMAC secret |
 
 ### 8.4 Rooms
@@ -841,11 +916,11 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 | GET | `/rooms/:id` | Room metadata |
 | DELETE | `/rooms/:id` | Delete room (owner only) |
 | POST | `/rooms/:id/leave` | Leave room |
-| POST | `/rooms/:id/transfer` | Transfer ownership to another member |
+| POST | `/rooms/:id/transfer` | Transfer ownership |
 | GET | `/rooms/:id/members` | List members |
-| POST | `/rooms/:id/members` | Add member (MLS Add + Welcome) |
+| POST | `/rooms/:id/members` | Add member |
 | DELETE | `/rooms/:id/members/:uid` | Kick |
-| POST | `/rooms/:id/members/:uid/promote` | Promote to moderator (Discord mode) |
+| POST | `/rooms/:id/members/:uid/promote` | Promote to moderator |
 | POST | `/rooms/:id/members/:uid/demote` | Demote |
 | POST | `/rooms/:id/invites` | Create room invite |
 | GET | `/rooms/:id/invites` | List room invites |
@@ -857,7 +932,7 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 |---|---|---|
 | POST | `/keypackages` | Upload KeyPackage batch |
 | GET | `/keypackages/count` | Count unconsumed packages |
-| POST | `/keypackages/claim` | Atomically claim a user's KeyPackage |
+| POST | `/keypackages/claim` | Atomically claim a KeyPackage |
 | GET | `/welcomes` | List pending welcomes |
 | POST | `/welcomes/:id/consume` | Mark welcome consumed |
 | POST | `/rooms/:id/messages` | Publish MLS ciphertext via Sockudo |
@@ -875,61 +950,61 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 
 ## 9. CLI Subcommands
 
-The server binary exposes these subcommands in addition to running the HTTP server:
-
 | Command | Purpose |
 |---|---|
 | `server` | Run the HTTP server (default) |
-| `server restore --from <path> --confirm` | Restore from backup. Offline only. Requires shell access. |
+| `server restore --from <path> --confirm` | Restore from backup |
 | `server migrate` | Run pending migrations and exit |
-| `server rotate-vapid` | Rotate VAPID keys and exit |
-| `server rotate-altcha` | Rotate ALTCHA HMAC secret and exit |
-| `server rotate-oprf --confirm` | Resample the OPRF seed. Invalidates all user registrations. Requires explicit confirmation. |
+| `server rotate-vapid` | Rotate VAPID keys |
+| `server rotate-altcha` | Rotate ALTCHA HMAC secret |
+| `server rotate-oprf --confirm` | Resample the OPRF seed |
 
 ---
 
-## 10. Client Capability Matrix
+## 10. Client Contract Matrix
 
-| Capability | Web | iOS | Android | Desktop (Tauri) |
-|---|---|---|---|---|
-| Text messaging | ✅ | ✅ | ✅ | ✅ |
-| Attachments | ✅ | ✅ | ✅ | ✅ |
-| Push notifications | Web Push | APNs | FCM | Native |
-| Hardware key store | ❌ | Secure Enclave | Keystore | OS keychain |
-| Database encryption | App-layer (WebCrypto) | SQLCipher | SQLCipher | SQLCipher |
-| Safety numbers | ✅ | ✅ | ✅ | ✅ |
-| Multi-device | ✅ | ✅ | ✅ | ✅ |
-| Recovery | ✅ | ✅ | ✅ | ✅ |
-| ALTCHA widget | ✅ | ✅ | ✅ | ✅ |
-| Calling (V2) | ✅ | ✅ | ✅ | ✅ |
+This matrix describes **server behaviour** for features the client relies on. Client-side implementation is not specified here.
+
+| Feature | Server behaviour |
+|---|---|
+| Text messaging | Relays MLS ciphertext via Sockudo; never inspects content |
+| Attachments | Content-addressed blob storage; server stores ciphertext only |
+| Push notifications | Accepts subscriptions for `web`, `ios`, `android`, `desktop`; suppresses per-device based on recent live session |
+| Multi-device | Supports up to `devices_per_user` (default 10); each device has an independent `client_id` |
+| Safety numbers | Advisory only; server never sees them |
+| ALTCHA | Challenge endpoint on registration only |
+| Calling (V2) | Advertised as `calling: false` in `/capabilities` |
+| Data export | Returns ZIP of ciphertext and account metadata |
+| Account deletion | Anonymises user record; cascades session, device, KeyPackage, MLS Remove |
 
 ---
 
 ## 11. Phased Build Plan
 
-Each phase is a discrete Jules task with verifiable deliverables.
-
 | Phase | Deliverable | Depends On |
 |---|---|---|
-| 1 | Axum scaffold + SQLite migrations + health + capabilities endpoints | — |
+| 1 | Axum scaffold + SQLite migrations + health + capabilities | — |
 | 2 | Roles, permissions, user_roles tables + seed data | 1 |
-| 3a | OPAQUE registration flow (server setup + start/finish endpoints) | 2 |
-| 3a.1 | ALTCHA proof-of-work protection on registration endpoints | 3a |
-| 3b | OPAQUE login flow (start/finish endpoints + identity key upload) | 3a.1 |
-| 4 | Session management + device registration + device revocation cascade | 3b |
-| 5 | Server invite codes (create, redeem, revoke) | 3a.1 |
-| 6 | Instance config, limits API, cleanup jobs, `/ready` endpoint | 4 |
+| 3a | OPAQUE registration flow | 2 |
+| 3a.1 | ALTCHA proof-of-work protection | 3a |
+| 3b | OPAQUE login flow | 3a.1 |
+| 4a | Auth middleware + session management | 3b |
+| 4b | Device registration + revocation cascade | 4a |
+| 5 | Server invite codes | 3a.1 |
+| 6a | Instance config, limits, audit log, readiness | 4a |
+| 6b | Cleanup scheduler + jobs | 6a |
+| 6c | Account deletion + data export (GDPR) | 6a |
 | 7 | Room CRUD + membership + ownership transfer | 5 |
 | 8 | Room invites | 7 |
 | 9 | KeyPackage upload, claim, quota enforcement | 7 |
-| 10 | Welcome routing + MLS epoch linearization + Welcome expiry | 9 |
+| 10 | Welcome routing + MLS epoch linearization | 9 |
 | 11 | Sockudo integration (publish, subscribe, history) | 10 |
 | 12 | Attachment upload, download, content addressing, retention pruning | 11 |
-| 13 | Admin web UI (Coralite) | 6 |
+| 13 | Admin web UI (Coralite) | 6a |
 | 14 | User web UI (Coralite) | 11 |
 | 15 | Push notifications (Web Push first) | 14 |
 | 16 | APNs and FCM support | 15 |
-| 17 | Automatic backups (SQLite + Sockudo) + restore CLI | 6 |
+| 17 | Automatic backups + restore CLI | 6a |
 | 18 | Tauri desktop client | 14 |
 | 19 | Capacitor iOS client | 14 |
 | 20 | Capacitor Android client | 14 |
@@ -942,25 +1017,163 @@ Each phase is a discrete Jules task with verifiable deliverables.
 |---|---|
 | Server sees plaintext messages | Never |
 | Server sees decryption keys | Never |
-| Server sees message metadata | Minimal: room ID, sender client ID, epoch, timestamp (coarsened) |
+| Server sees message metadata | Minimal: room ID, sender client ID, epoch, coarsened timestamp |
 | Server sees profile contents | Never (profile_blob is E2E encrypted) |
 | Server sees display name | Yes (required for push notifications) |
 | Server sees username | Yes (required for lookup) |
 | Server sees attachment contents | Never (blobs are encrypted before upload) |
-| Server can MITM group joins | Only if safety numbers are not verified. Soft warning mitigates. |
+| Server can MITM group joins | Only if safety numbers are not verified |
 | Server can decrypt past messages | No (forward secrecy via MLS) |
 | Server can decrypt future messages after compromise | No (post-compromise security via MLS) |
 | Web client is protected against compromised server | No. Web code is host-delivered. |
 | Native client is protected against compromised server | Yes. Signed binaries with independent update channel. |
-| Browser memory is zero-trace | No. V8 string immutability and GC churn prevent it. |
-| Native memory is zero-trace | Yes. Deterministic via `zeroize::ZeroizeOnDrop`. |
 | Registration endpoints are bot-resistant | Yes. ALTCHA PoW v2 in deterministic mode. |
 | Registration endpoints use third-party CAPTCHA | Never. ALTCHA is fully self-hosted. |
+| Server can force peers to delete local copies | No. Tombstones are advisory. |
 
 ---
 
-## 13. Document Status
+## 13. Backups and Disaster Recovery
 
-This is the contract. Every Jules task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing from this spec, it does not exist yet — it must be added here first, then built.
+- Automatic snapshots of SQLite, OPRF key, and optionally attachment blobs every `BACKUP_INTERVAL_HOURS`.
+- Snapshots are encrypted with `backup_key` derived from the root secret.
+- Retention: `BACKUP_RETENTION_COUNT` (default 30).
+- Restore is CLI-only: `server restore --from <path> --confirm`.
+- The API lists backups and triggers manual backups but cannot restore them.
+
+**Backup exclusions:** Client-side keys are never backed up. If a client's device is lost and the recovery code is lost, the data is unrecoverable. This is a documented property of E2EE, not a bug.
+
+---
+
+## 14. GDPR Compliance
+
+The controller (the person running the instance) is responsible for responding to data subject requests. The software provides the technical mechanisms. Legal obligations rest with the controller.
+
+### 14.1 Data Subject Rights
+
+| Right | Article | Server mechanism |
+|---|---|---|
+| Right of access | Art. 15 | `GET /users/me/export` |
+| Right to rectification | Art. 16 | `PATCH /users/me` (display name, profile) |
+| Right to erasure | Art. 17 | `DELETE /users/me` |
+| Right to restriction | Art. 18 | Account disable (admin endpoint) |
+| Right to data portability | Art. 20 | Machine-readable ZIP export |
+| Right to object | Art. 21 | Account deletion |
+
+### 14.2 Account Deletion — `DELETE /api/v1/users/me`
+
+**Request body:**
+
+```json
+{
+  "confirm": "DELETE",
+  "password": "<OPAQUE password for verification>"
+}
+```
+
+**Behavior:**
+
+1. Re-authenticate via OPAQUE. Deletion requires password confirmation.
+2. In a single transaction:
+   - Delete all sessions for the user.
+   - Delete all devices for the user (cascades sessions).
+   - Delete all unconsumed KeyPackages for the user.
+   - Queue MLS Removes for every room the user is a member of.
+   - Delete all push subscriptions for the user.
+   - Delete the `recovery_vault` record if it exists.
+   - Anonymise the user row:
+     - `username = "deleted_<random>"`
+     - `username_hash = <random>`
+     - `display_name = NULL`
+     - `profile_blob = NULL`
+     - `opaque_registration = <random 32 bytes>`
+     - `identity_pubkey = ""`
+     - `disabled_at = now()`
+     - `deleted_at = now()`
+3. Log an audit entry with action `user.delete`.
+4. Return HTTP 204.
+
+**Why anonymise instead of hard delete:** `users.id` is referenced by `messages.sender_id`, `attachments.uploader_id`, and `room_members.user_id`. Hard deletion cascades and destroys data other users still need. Anonymisation preserves referential integrity while removing all personal data.
+
+### 14.3 Data Export — `GET /api/v1/users/me/export`
+
+Returns a ZIP archive:
+
+| File | Contents |
+|---|---|
+| `profile.json` | Username, display name, created_at, roles |
+| `devices.json` | Device list with client IDs and names |
+| `rooms.json` | Room membership with join dates |
+| `messages.json` | All server-visible message metadata (ciphertext, epoch, coarsened timestamps) |
+| `sessions.json` | Session history |
+| `audit.json` | Audit entries where the user is the actor |
+| `README.txt` | Format documentation and limitation notes |
+
+**Limitation:** The export contains ciphertext, not plaintext. The server cannot decrypt. The export is useful for the user's own records but requires the user's MLS keys to be read.
+
+**Rate limit:** One export per user per `EXPORT_RATE_LIMIT_HOURS` (default 24).
+
+### 14.4 Retention Policy
+
+Instance config key `DATA_RETENTION_DAYS` (env: `DATA_RETENTION_DAYS`, default `0` = forever). When set:
+
+- Sessions older than the retention window are purged.
+- Audit log entries older than `AUDIT_RETENTION_DAYS` are purged (already implemented).
+- Message history older than the retention window is purged from Sockudo history (Phase 10/12).
+- Attachments older than the retention window are purged (Phase 12).
+
+### 14.5 Tombstone Semantics
+
+When a user deletes a message:
+
+1. Client sends an MLS application message with `{"type":"tombstone","target_message_id":"..."}`.
+2. All clients mark the local message as deleted and render a tombstone.
+3. Server deletes its copy of the ciphertext from Sockudo history.
+4. Server cannot force peers to delete local copies. This is documented as a known limitation.
+
+**Server obligation:** Deleting the ciphertext from Sockudo history and the database satisfies Art. 17 obligations for the controller's own storage. Peer deletion is advisory.
+
+### 14.6 Metadata Minimisation
+
+| Field | Current | Minimisation |
+|---|---|---|
+| `devices.client_id` | Random 128-bit, client-generated | Keep — not a hardware identifier |
+| `sessions.last_seen_at` | Timestamp | Coarsen to hour |
+| `messages.created_at` | Timestamp | Coarsen to minute |
+| `audit_log.actor_id` | User ID | Keep — required for audit |
+| `audit_log.metadata` | JSON | Never include message content or IPs |
+| IP addresses | Not stored in schema | Ensure logs are rotated and not persisted indefinitely |
+
+### 14.7 Controller Obligations
+
+The controller is responsible for:
+
+- Publishing a privacy policy
+- Providing a DPA (Data Processing Agreement) to users if they are a business
+- Documenting where data is hosted (server location)
+- Documenting sub-processors (Sockudo if hosted separately, backup storage provider if S3)
+
+The software provides the technical mechanisms. Legal obligations rest with the controller.
+
+### 14.8 Audit Actions
+
+| Action | Triggered by |
+|---|---|
+| `user.delete` | `DELETE /users/me` |
+| `user.export` | `GET /users/me/export` |
+| `config.update` | Admin config change |
+| `secret.update` | Admin secret rotation |
+| `limits.update` | Admin limits change |
+| `role.grant` / `role.revoke` | Admin role change |
+| `invite.create` / `invite.revoke` | Invite management |
+| `device.revoke` | Device revocation |
+| `bootstrap.owner` | First user registration |
+| `vapid.rotate` / `altcha.rotate` | Secret rotation |
+
+---
+
+## 15. Document Status
+
+This is the contract for the server side of the system. Every Jules task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing from this spec, it does not exist yet — it must be added here first, then built.
 
 The spec is frozen for V1. New features go into V2. Bug fixes and clarifications are amendments, not revisions.
