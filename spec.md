@@ -1,4 +1,3 @@
-
 # Server Specification v1.0
 
 > **Status:** Frozen — source of truth for all Jules tasks.
@@ -20,10 +19,10 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 | API | Axum (Rust) |
 | Database | SQLite (embedded in the Axum process) |
 | Blob storage | S3 (default) or filesystem (fallback) |
+| S3 client | `rust-s3` |
 | MLS engine | Wire CoreCrypto 10.5.2 (client-side only) |
 | Auth | OPAQUE (aPAKE) via `opaque-ke` 4.0.1 |
 | Bot protection | ALTCHA Proof-of-Work v2 via `altcha` 0.2.0 |
-| S3 client | `rust-s3` |
 | Static SPA hosting | Axum `ServeDir` with SPA fallback |
 | TLS termination | External reverse proxy (Traefik via Coolify, or Caddy) |
 
@@ -42,7 +41,9 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Rooms as the unit of conversation (1:1 = 2-member room)
 - Text messaging with read receipts and typing indicators
 - Message deletion (tombstone; no editing)
-- Encrypted attachments with chunked AES-GCM and byte-range streaming
+- Encrypted attachments with chunked AES-GCM
+- Attachment range requests for streaming and seeking
+- Presigned URLs for direct S3 fetch (bypassing the API server)
 - Push notifications (Web Push, APNs, FCM, UnifiedPush)
 - Safety number verification (soft warning, non-blocking)
 - Recovery via multi-use one-time code list
@@ -81,6 +82,9 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Consent management UI
 - TLS termination inside the Axum process
 - ACME client inside the server
+- MP4 fast-start enforcement (client responsibility)
+- Multi-range HTTP requests
+- Range-restricted presigned URLs
 
 ---
 
@@ -248,7 +252,27 @@ RATE_PRESIGN_PER_MIN=60
 
 | Variable | Default | Notes |
 |---|---|---|
+| `RATE_INVITE_CREATE_HOURLY` | `50` | Invites created per user per hour |
+| `RATE_INVITE_CREATE_DAILY` | `200` | Invites created per user per day |
+| `RATE_INVITE_REDEEM_PER_MIN` | `10` | Redemption attempts per IP per minute |
+| `RATE_KP_CLAIM_PER_MIN` | `30` | KeyPackage claims per user per minute |
+| `RATE_KP_CLAIM_HOURLY` | `200` | KeyPackage claims per user per hour |
+| `RATE_LOGIN_PER_MIN` | `10` | Login attempts per IP per minute |
+| `RATE_LOGIN_LOCKOUT_MIN` | `15` | Lockout duration after threshold |
 | `RATE_PRESIGN_PER_MIN` | `60` | Presigned URL generation per user per minute |
+
+**Rate limit keys:** Rate limits are keyed per user, IP, or resource depending on the variant:
+
+| Variant | Key format | Window(s) |
+|---|---|---|
+| `InviteCreate` | `invite_create:{user_id}:{hour\|day}:{boundary}` | Hourly, Daily |
+| `InviteRedeem` | `invite_redeem:{ip}:min:{boundary}` | Per minute |
+| `KpClaim` | `kp_claim:{user_id}:{minute\|hour}:{boundary}` | Per minute, Hourly |
+| `Login` | `login:{ip}:min:{boundary}` | Per minute |
+| `DataExport` | `data_export:{user_id}:{boundary}` | `EXPORT_RATE_LIMIT_HOURS` |
+| `Presign` | `presign:{user_id}:min:{boundary}` | Per minute |
+
+Rate limit state is stored in a SQLite table and pruned hourly (entries older than 24 hours).
 
 ### 5.7 Transport Security
 
@@ -320,6 +344,8 @@ backup_key  = HKDF(root_secret, info="backup-encryption-v1")
 
 **Restore procedure:** CLI only. `server restore --from <path> --confirm`.
 
+**S3 backend note:** Attachment blobs on S3 are not backed up by the server. Rely on S3's durability and versioning. If `STORAGE_BACKEND=s3` and `BACKUP_INCLUDE_ATTACHMENTS=true`, the server fails startup with a clear error — S3 blobs cannot be snapshotted by this mechanism.
+
 ### 5.10 Push Notifications
 
 ```env
@@ -386,15 +412,34 @@ S3_PRESIGN_TTL_SECONDS=600
 | `S3_ACCESS_KEY_ID` | — | Required for S3 backend |
 | `S3_SECRET_ACCESS_KEY` | — | Required for S3 backend |
 | `S3_PATH_STYLE` | `false` | Set `true` for MinIO and most self-hosted S3-compatible services |
-| `S3_PRESIGN_TTL_SECONDS` | `600` | Presigned URL lifetime (10 minutes) |
+| `S3_PRESIGN_TTL_SECONDS` | `600` | Default presigned URL lifetime (10 minutes) |
 
-**S3 crate:** `rust-s3`. Selected over `aws-sdk-s3` for binary size (~445 KB vs ~14 MB) and simpler configuration. Streaming is not required — attachments are capped at 100 MB and buffered in memory during a single fetch.
+**S3 crate:** `rust-s3`. Selected over `aws-sdk-s3` for binary size (~445 KB vs ~14 MB) and simpler configuration. Streaming is not required — attachments are capped at 100 MB and buffered in memory per fetch.
 
 **Backend selection:** At startup, the server initializes the storage backend based on `STORAGE_BACKEND`. Missing required variables cause startup failure with a clear error.
 
-**Filesystem layout:** Blobs are stored at `{STORAGE_FS_PATH}/{id[0..2]}/{id[2..4]}/{id}` where `id` is a 64-character hex string. Two-level sharding prevents directory bloat.
+**Filesystem layout:** Blobs are stored at `{STORAGE_FS_PATH}/attachments/{id[0..2]}/{id[2..4]}/{id}` where `id` is a 64-character hex string. Two-level sharding prevents directory bloat.
 
 **S3 key layout:** Blobs are stored at `attachments/{id[0..2]}/{id[2..4]}/{id}`. The same sharding applies.
+
+**Key validation:** Storage keys are validated against `^attachments/[0-9a-f]{2}/[0-9a-f]{2}/[0-9a-f]{64}$` before any operation. Malformed keys are rejected with `StorageError::InvalidKey`.
+
+**Presign support:**
+
+| Backend | Presign | Notes |
+|---|---|---|
+| `fs` | Not supported | Presign endpoint returns `501 presign_not_supported`. Clients use proxied `GET` with `Range`. |
+| `s3` | Supported | Presign endpoint returns a signed URL. Clients fetch ranges directly from S3. |
+
+**Presign TTL clamping:**
+
+- **Minimum:** 30 seconds
+- **Maximum:** `2 × S3_PRESIGN_TTL_SECONDS`
+- **Default:** `S3_PRESIGN_TTL_SECONDS`
+
+A client may request a specific TTL via the presign request body. The server clamps the requested value to `[30, 2 × S3_PRESIGN_TTL_SECONDS]`.
+
+**Presigned URL scope:** S3 presigned URLs grant access to the **entire object**, not a specific byte range. The client sends a `Range` header when fetching from S3 to retrieve only the bytes it needs. This is a limitation of the S3 signing mechanism, not a design choice.
 
 ### 5.13 Attachment Format
 
@@ -410,7 +455,7 @@ ATTACHMENT_BUCKET_SIZES=65536,524288,4194304,33554432
 
 **Chunk size:** Fixed at 64 KB. Do not change without a spec revision — the value is embedded in every stored attachment's manifest.
 
-**Bucket sizes:** Comma-separated list. Must be strictly increasing. Each value must be a multiple of `ATTACHMENT_CHUNK_SIZE` plus 16 bytes per chunk (the GCM tag overhead).
+**Bucket sizes:** Comma-separated list. Must be strictly increasing. Each value must be a multiple of `ATTACHMENT_CHUNK_SIZE` (with the GCM tag overhead per chunk accounted for).
 
 **Padding:** The client pads the encrypted blob to the nearest bucket. The server verifies the padded size matches a bucket and rejects uploads that do not.
 
@@ -606,15 +651,49 @@ After chunked encryption, the client pads the ciphertext to the nearest bucket f
 - The client decides whether to fetch all chunks at once or lazily based on file size and MIME type.
 - **Recommended threshold:** files ≤ 1 MB are fetched in a single request; files > 1 MB are fetched lazily.
 - **Media (audio/video):** always fetched lazily, regardless of size.
-- The client maps plaintext ranges to encrypted ranges and issues `Range` requests.
-- The server translates and serves ranges without knowledge of playback position.
+- **The client is responsible for translating plaintext ranges to encrypted ranges.** The server does not translate.
+
+**Translation formula:**
+
+Given a plaintext range `[p_start, p_end]` and manifest fields:
+
+```
+start_chunk       = p_start / chunk_size
+end_chunk         = p_end / chunk_size
+encrypted_start   = start_chunk * (chunk_size + 16)
+encrypted_end     = (end_chunk + 1) * (chunk_size + 16) - 1
+```
+
+The client sends `Range: bytes=<encrypted_start>-<encrypted_end>` to the server (or to S3 via a presigned URL).
+
+The server returns the requested encrypted bytes. The client decrypts each chunk individually using the derived IVs, verifies each auth tag, and slices out the requested plaintext range.
 
 ### 6.9 Attachments — Presigned URLs
 
 - For S3 backends, the client fetches ranges directly from S3 using presigned URLs.
-- The client requests a fresh URL per seek operation. Do not cache presigned URLs.
+- The client requests a fresh URL per seek operation. **Do not cache presigned URLs.**
 - Presigned URLs support `Range` headers natively.
 - The client must handle URL expiry mid-download by requesting a new URL and resuming.
+
+**Presign request:**
+
+```json
+{
+  "expires_in_seconds": 600
+}
+```
+
+The field is optional. If omitted, the server uses `S3_PRESIGN_TTL_SECONDS`.
+
+**TTL clamping:**
+
+- Minimum: 30 seconds
+- Maximum: `2 × S3_PRESIGN_TTL_SECONDS`
+- Default: `S3_PRESIGN_TTL_SECONDS`
+
+**Presigned URL scope:** The URL grants access to the entire object. It does **not** restrict to a specific byte range. The client sends a `Range` header when fetching from S3. A leaked URL grants access to encrypted bytes only — without the encryption key (which is not in the URL), the blob is useless.
+
+**Filesystem backends:** Presign is not supported. The endpoint returns `501 presign_not_supported`. Clients read `storage_backend` from `/capabilities` and use the proxied `GET /attachments/:id` with a `Range` header instead.
 
 ### 6.10 Attachments — MP4 Streaming
 
@@ -624,27 +703,49 @@ For MP4 files to stream and seek properly:
 - The client must validate this before upload and reject or re-encode files that are not fast-start.
 - This is a container-format constraint, not an encryption constraint.
 
-### 6.11 Room Membership
+The server does not enforce fast-start validation. It is a client responsibility.
+
+### 6.11 Range Request Format
+
+The client sends a `Range` header in the standard HTTP format:
+
+- `Range: bytes=START-END` — inclusive range
+- `Range: bytes=START-` — from START to end of file
+- `Range: bytes=-SUFFIX` — last SUFFIX bytes
+
+**Supported:**
+- Single ranges only
+- `bytes` unit only
+
+**Not supported:**
+- Multiple ranges (`bytes=0-100,200-300`) → `416 Range Not Satisfiable`
+- Non-bytes units (`items=0-100`) → `416 Range Not Satisfiable`
+
+**Server response:** `206 Partial Content` with `Content-Range: bytes START-END/TOTAL`.
+
+**Clipping:** If the requested range extends beyond the file size, the server serves the available bytes and returns the actual range in `Content-Range`. This matches RFC 7233 §4.4.
+
+### 6.12 Room Membership
 
 - Room membership is server-visible at the user level.
 - MLS leaf-level membership is client-visible only.
 
-### 6.12 Push Subscriptions
+### 6.13 Push Subscriptions
 
 - Register via `POST /users/me/push-subscriptions`.
 - `platform` must be `web`, `ios`, `android`, or `desktop`.
 
-### 6.13 Safety Numbers
+### 6.14 Safety Numbers
 
 - Clients compute and display safety numbers out-of-band.
 - The server never sees safety numbers.
 
-### 6.14 WebSocket Connection
+### 6.15 WebSocket Connection
 
 - Connect to the URL advertised in `GET /api/v1/capabilities` (`websocket_url`).
 - Production: always `wss://`.
 
-### 6.15 Client Capability Requirements
+### 6.16 Client Capability Requirements
 
 - Read `GET /api/v1/capabilities` on startup.
 - Degrade gracefully if a capability is unavailable.
@@ -837,21 +938,21 @@ CREATE INDEX idx_room_messages_sender
 
 ```sql
 CREATE TABLE attachments (
-    id                TEXT PRIMARY KEY,
-    room_id           TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    uploader_id       TEXT NOT NULL REFERENCES users(id),
+    id                 TEXT PRIMARY KEY,
+    room_id            TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    uploader_id        TEXT NOT NULL REFERENCES users(id),
     uploader_client_id TEXT,
-    storage_backend   TEXT NOT NULL CHECK(storage_backend IN ('fs', 's3')),
-    storage_key       TEXT NOT NULL,
-    padded_size       INTEGER NOT NULL,
-    plaintext_size    INTEGER NOT NULL,
-    encrypted_size    INTEGER NOT NULL,
-    chunk_size        INTEGER NOT NULL,
-    chunk_count       INTEGER NOT NULL,
-    nonce_prefix      TEXT NOT NULL,
-    base_counter      INTEGER NOT NULL,
-    content_type      TEXT NOT NULL DEFAULT 'application/octet-stream',
-    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    storage_backend    TEXT NOT NULL CHECK(storage_backend IN ('fs', 's3')),
+    storage_key        TEXT NOT NULL,
+    padded_size        INTEGER NOT NULL,
+    plaintext_size     INTEGER NOT NULL,
+    encrypted_size     INTEGER NOT NULL,
+    chunk_size         INTEGER NOT NULL,
+    chunk_count        INTEGER NOT NULL,
+    nonce_prefix       TEXT NOT NULL,
+    base_counter       INTEGER NOT NULL,
+    content_type       TEXT NOT NULL DEFAULT 'application/octet-stream',
+    created_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_attachments_room_created
@@ -867,11 +968,11 @@ CREATE INDEX idx_attachments_created
 **Column notes:**
 
 - `id` — SHA-256 hex of the padded ciphertext.
-- `storage_backend` — `'fs'` or `'s3'`. Set at upload time based on the active backend. Enables future migrations.
+- `storage_backend` — `'fs'` or `'s3'`. Recorded at upload time. Enables future migrations.
 - `storage_key` — path or S3 key. Derived from `id` but stored explicitly for backend flexibility.
-- `padded_size` — total bytes uploaded (a bucket value).
+- `padded_size` — total uploaded bytes (a bucket value).
 - `plaintext_size` — original file size, before encryption.
-- `encrypted_size` — `padded_size`, but semantically distinct for clarity.
+- `encrypted_size` — same as `padded_size`; kept separate for clarity.
 - `chunk_size` — plaintext bytes per chunk (64 KB default).
 - `chunk_count` — number of chunks including padding.
 - `nonce_prefix` — base64 of the 7-byte prefix.
@@ -1013,12 +1114,24 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
     "cost": 5000
   },
   "storage_backend": "s3",
+  "storage_presign_supported": true,
+  "storage_presign_max_ttl_seconds": 1200,
   "attachment_chunk_size": 65536,
   "attachment_bucket_sizes": [65536, 524288, 4194304, 33554432],
+  "attachment_accept_ranges": true,
   "safety_number_mode": "warn",
   "moderation_mode": "messenger"
 }
 ```
+
+| Field | Notes |
+|---|---|
+| `storage_backend` | `"fs"` or `"s3"` |
+| `storage_presign_supported` | `true` for S3, `false` for filesystem |
+| `storage_presign_max_ttl_seconds` | Maximum TTL a client may request. Equals `2 × S3_PRESIGN_TTL_SECONDS` when S3 is active. |
+| `attachment_chunk_size` | Chunk size in bytes |
+| `attachment_bucket_sizes` | Valid padded sizes for upload |
+| `attachment_accept_ranges` | Always `true` in V1 |
 
 ### 8.2 User
 
@@ -1106,9 +1219,40 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 | DELETE | `/attachments/:id` | Delete (uploader only) |
 | POST | `/attachments/:id/presign` | Generate a presigned URL (S3 only) |
 
-**Upload request:** `multipart/form-data` with a `file` part and a `claimed_id` field; or `application/octet-stream` with `X-Claimed-Id` header.
+#### 8.6.1 Upload
 
-**Upload response:**
+**Request — Multipart:** `multipart/form-data` with parts:
+
+| Part | Type | Required |
+|---|---|---|
+| `file` | binary | Yes |
+| `claimed_id` | text (64 hex chars) | Yes |
+| `plaintext_size` | text (integer) | Yes |
+| `encrypted_size` | text (integer) | Yes |
+| `chunk_size` | text (integer) | Yes |
+| `chunk_count` | text (integer) | Yes |
+| `nonce_prefix` | text (base64) | Yes |
+| `base_counter` | text (integer) | Yes |
+| `content_type` | text | No (default `application/octet-stream`) |
+| `uploader_client_id` | text | No |
+
+**Request — Octet-stream:** `Content-Type: application/octet-stream` with the binary in the body and metadata in headers:
+
+| Header | Required |
+|---|---|
+| `X-Claimed-Id` | Yes |
+| `X-Plaintext-Size` | Yes |
+| `X-Encrypted-Size` | Yes |
+| `X-Chunk-Size` | Yes |
+| `X-Chunk-Count` | Yes |
+| `X-Nonce-Prefix` | Yes |
+| `X-Base-Counter` | Yes |
+| `X-Content-Type` | No |
+| `X-Uploader-Client-Id` | No |
+
+**Effective file size limit:** `MIN(room.max_file_size_bytes, instance.file_size_bytes, server_max.file_size_bytes)`. Exceeding returns 413.
+
+**Response — 201:**
 
 ```json
 {
@@ -1116,57 +1260,141 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
   "room_id": "<room_id>",
   "uploader_id": "<user_id>",
   "padded_size": 65536,
-  "plaintext_size": 104857600,
-  "encrypted_size": 104883216,
+  "plaintext_size": 100000,
+  "encrypted_size": 100016,
   "chunk_size": 65536,
-  "chunk_count": 1600,
+  "chunk_count": 2,
+  "nonce_prefix": "<base64>",
+  "base_counter": 1234,
   "content_type": "video/mp4",
   "created_at": "<ISO 8601>"
 }
 ```
 
-**Download:** Standard `GET` returns the whole blob. With `Range: bytes=N-M`, returns `206 Partial Content` with the translated encrypted range. The client decrypts the chunks in that range. Headers:
+**Errors:**
+
+| Error | HTTP | `error` field |
+|---|---|---|
+| Not a member | 404 | `room_not_found` |
+| Missing `file` | 400 | `missing_file` |
+| Missing or invalid `claimed_id` | 400 | `invalid_claimed_id` |
+| Invalid manifest field | 400 | `invalid_manifest` with `details: {field, reason}` |
+| Hash mismatch | 400 | `hash_mismatch` with `details: {expected, computed}` |
+| Invalid bucket size | 413 | `invalid_bucket_size` with `details: {received, allowed}` |
+| File too large | 413 | `file_too_large` with `details: {limit, received}` |
+| Duplicate ID with different owner | 409 | `id_conflict` |
+| Unsupported content type | 415 | `unsupported_media_type` |
+| Storage error | 500 | `internal` |
+
+#### 8.6.2 Download
+
+Supports the standard HTTP `Range` header for partial content. See §6.11 for the supported syntax.
+
+**Full download — Response — 200:**
 
 ```
 Content-Type: application/octet-stream
-Content-Length: <range length>
-Content-Range: bytes N-M/total
+Content-Length: <padded_size>
+Content-Disposition: inline
+Accept-Ranges: bytes
 Cache-Control: private, max-age=86400, immutable
 ETag: "<id>"
 X-Attachment-Content-Type: <content_type>
-X-Attachment-Chunk-Size: 65536
-X-Attachment-Plaintext-Size: 104857600
-X-Attachment-Nonce-Prefix: <base64>
-X-Attachment-Base-Counter: <int>
+X-Attachment-Chunk-Size: <chunk_size>
+X-Attachment-Chunk-Count: <chunk_count>
+X-Attachment-Plaintext-Size: <plaintext_size>
+X-Attachment-Encrypted-Size: <encrypted_size>
+X-Attachment-Nonce-Prefix: <nonce_prefix>
+X-Attachment-Base-Counter: <base_counter>
 X-Content-Type-Options: nosniff
 ```
 
-**Presign request:**
+**Range download — Response — 206:**
+
+Same headers as full download, plus:
+
+```
+Content-Range: bytes <start>-<end>/<padded_size>
+Content-Length: <end - start + 1>
+```
+
+**`If-None-Match`:** A matching ETag returns `304 Not Modified` with no body. This takes precedence over range serving.
+
+**Unsupported or unsatisfiable ranges — Response — 416:**
+
+```
+Content-Range: bytes */<padded_size>
+```
+
+No body.
+
+**Errors:**
+
+| Error | HTTP | `error` field |
+|---|---|---|
+| Not found or not a member | 404 | `attachment_not_found` |
+| Malformed range | 416 | `range_not_satisfiable` |
+| Range out of bounds | 416 | `range_not_satisfiable` |
+| Multiple ranges | 416 | `range_not_satisfiable` |
+| Non-`bytes` unit | 416 | `range_not_satisfiable` |
+| Storage read error | 500 | `internal` |
+
+#### 8.6.3 Presign
+
+**Request:**
 
 ```json
 {
-  "range_start": 0,
-  "range_end": 65535,
   "expires_in_seconds": 600
 }
 ```
 
-**Presign response:**
+The field is optional. If omitted, `S3_PRESIGN_TTL_SECONDS` is used.
+
+**Response — 200:**
 
 ```json
 {
-  "url": "https://s3.example.com/...",
-  "expires_at": "<ISO 8601>",
-  "range_start": 0,
-  "range_end": 65535
+  "url": "https://s3.example.com/bucket/attachments/ab/cd/abc...?X-Amz-...",
+  "expires_at": "2026-09-28T14:32:11Z"
 }
 ```
 
-The presigned URL supports range requests. The client fetches directly from S3, bypassing the Axum server for blob traffic.
+**TTL clamping:**
 
-**Presign is only available when `STORAGE_BACKEND=s3`.** For filesystem, the client uses `GET /attachments/:id` with a `Range` header.
+- Minimum: 30 seconds
+- Maximum: `2 × S3_PRESIGN_TTL_SECONDS`
+- Default: `S3_PRESIGN_TTL_SECONDS`
 
-**Rate limit:** `RATE_PRESIGN_PER_MIN` per user.
+**Rate limit:** `RATE_PRESIGN_PER_MIN` per user per minute.
+
+**Presigned URL scope:** Grants read access to the entire object. The client sends a `Range` header when fetching to retrieve specific bytes.
+
+**Errors:**
+
+| Error | HTTP | `error` field |
+|---|---|---|
+| Not found or not a member | 404 | `attachment_not_found` |
+| Presign not supported | 501 | `presign_not_supported` |
+| Invalid `expires_in_seconds` | 400 | `invalid_expires_in` |
+| Rate limited | 429 | `rate_limited` with `details: {reset_at}` |
+| Storage error | 500 | `internal` |
+
+**Filesystem backend:** Returns HTTP 501 `presign_not_supported`. Clients detect this via `storage_presign_supported` in `/capabilities` before calling.
+
+#### 8.6.4 Delete
+
+Only the uploader can delete an attachment.
+
+**Response — 204 No Content.**
+
+**Errors:**
+
+| Error | HTTP | `error` field |
+|---|---|---|
+| Not found | 404 | `attachment_not_found` |
+| Not the uploader | 403 | `forbidden` |
+| Storage error (best-effort) | — | logged only |
 
 ---
 
@@ -1189,8 +1417,11 @@ The presigned URL supports range requests. The client fetches directly from S3, 
 | Feature | Server behaviour |
 |---|---|
 | Text messaging | Relays MLS ciphertext via Sockudo; never inspects content |
-| Attachments | Content-addressed, chunked AES-GCM, supports range requests |
-| Attachment streaming | Server supports `Range` headers on download; presigned URLs for S3 |
+| Attachments — upload | Content-addressed, chunked AES-GCM, validates manifest |
+| Attachments — download | Supports `Range` headers; returns `206 Partial Content` |
+| Attachments — streaming | Client translates plaintext ranges; server serves encrypted bytes |
+| Attachments — presign | S3 only; returns signed URLs; filesystem returns 501 |
+| Attachment chunk format | 64 KB plaintext chunks, per-chunk derived IVs, position-bound AAD |
 | Push notifications | Accepts `web`, `ios`, `android`, `desktop`; suppresses per-device |
 | Multi-device | Up to `devices_per_user` (default 10) |
 | Safety numbers | Advisory only; server never sees them |
@@ -1201,6 +1432,7 @@ The presigned URL supports range requests. The client fetches directly from S3, 
 | WebSocket | `wss://` in production, `ws://` in development |
 | HTTPS | Enforced by reverse proxy; server redirects and sends HSTS |
 | Storage backend | Advertised as `storage_backend` in `/capabilities` |
+| Presign support | Advertised as `storage_presign_supported` in `/capabilities` |
 
 ---
 
@@ -1260,17 +1492,20 @@ The presigned URL supports range requests. The client fetches directly from S3, 
 | Server can force peers to delete local copies | No. Tombstones are advisory. |
 | Production traffic is HTTPS | Yes. Enforced by reverse proxy. |
 | Attachments are streamed via range requests | Yes, with chunked AES-GCM. |
-| Attachments are vulnerable to truncation attacks | Mitigated by per-chunk AAD with chunk_count and is_last. |
+| Attachments are vulnerable to truncation attacks | Mitigated by per-chunk AAD with `chunk_count` and `is_last`. |
+| Presigned URLs grant access to full object | Yes — but only encrypted bytes. TTL-limited to `2 × S3_PRESIGN_TTL_SECONDS`. |
+| Presigned URLs are range-restricted | No. Client adds `Range` header on fetch. |
 
 ---
 
 ## 13. Backups and Disaster Recovery
 
 - Automatic snapshots of SQLite and the OPRF key every `BACKUP_INTERVAL_HOURS`.
-- Attachment blobs are included only if `BACKUP_INCLUDE_ATTACHMENTS=true`.
-- Snapshots encrypted with `backup_key` derived from the root secret.
-- Restore is CLI-only.
-- Attachment blobs on S3 are not backed up by the server — rely on S3's own durability and versioning.
+- Attachment blobs on filesystem are included only if `BACKUP_INCLUDE_ATTACHMENTS=true`.
+- Attachment blobs on S3 are **not** backed up by the server. Rely on S3 durability.
+- Snapshots are encrypted with `backup_key` derived from the root secret.
+- Restore is CLI-only: `server restore --from <path> --confirm`.
+- The API lists backups and triggers manual backups but cannot restore them.
 
 ---
 
@@ -1309,7 +1544,7 @@ Timestamps coarsened where practical. No IP addresses in the database. Audit met
 
 ### 14.7 Controller Obligations
 
-Controller publishes privacy policy, provides DPA if needed, documents server location and sub-processors (Sockudo, S3).
+Controller publishes privacy policy, provides DPA if needed, documents server location and sub-processors (Sockudo, S3 provider).
 
 ### 14.8 Audit Actions
 
