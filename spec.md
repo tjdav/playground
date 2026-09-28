@@ -3,10 +3,10 @@
 
 > **Status:** Frozen — source of truth for all Jules tasks.
 > **Scope:** This document describes the **server-side contract only**. Client implementation is out of scope and will be covered by a separate client specification.
-> **Stack:** Sockudo + Axum + SQLite + OPAQUE + ALTCHA
+> **Stack:** Sockudo + Axum + SQLite + OPAQUE + ALTCHA + S3 (or filesystem)
 > **Deployment:** Single VPS, Docker-based, self-hosted. Two containers: `server` (Axum + static SPA hosting) and `sockudo`. TLS terminates at a reverse proxy (Coolify/Traefik or Caddy).
 
-Any change to this document requires an explicit revision and a corresponding task update. Frozen means: no feature additions, no schema changes, no API surface changes without a spec revision and a documented migration path.
+Any change to this document requires an explicit revision and a corresponding task update.
 
 ---
 
@@ -19,10 +19,11 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 | Delivery | Sockudo (WebSocket, Pusher v7, Protocol V2 history) |
 | API | Axum (Rust) |
 | Database | SQLite (embedded in the Axum process) |
-| Blob storage | Filesystem or S3 (content-addressed) |
+| Blob storage | S3 (default) or filesystem (fallback) |
+| MLS engine | Wire CoreCrypto 10.5.2 (client-side only) |
 | Auth | OPAQUE (aPAKE) via `opaque-ke` 4.0.1 |
 | Bot protection | ALTCHA Proof-of-Work v2 via `altcha` 0.2.0 |
-| MLS engine | Wire CoreCrypto 10.5.2 (client-side only) |
+| S3 client | `rust-s3` |
 | Static SPA hosting | Axum `ServeDir` with SPA fallback |
 | TLS termination | External reverse proxy (Traefik via Coolify, or Caddy) |
 
@@ -41,7 +42,7 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Rooms as the unit of conversation (1:1 = 2-member room)
 - Text messaging with read receipts and typing indicators
 - Message deletion (tombstone; no editing)
-- Encrypted attachments with configurable size limits
+- Encrypted attachments with chunked AES-GCM and byte-range streaming
 - Push notifications (Web Push, APNs, FCM, UnifiedPush)
 - Safety number verification (soft warning, non-blocking)
 - Recovery via multi-use one-time code list
@@ -49,7 +50,7 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Automatic SQLite + Sockudo backups
 - Three-tier resource limits (server / instance / entity)
 - Display name separate from immutable username
-- Server-side cleanup jobs (sessions, rate limits, audit log, attachments, welcomes)
+- Server-side cleanup jobs
 - GDPR data subject rights (access, erasure, portability)
 - Static SPA hosting from the same origin as the API
 - HTTPS enforcement via reverse proxy with HSTS
@@ -62,7 +63,7 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Message editing
 - Reactions
 - Threading
-- Multi-seed OPRF rotation (dependent on `opaque-ke` library support)
+- Multi-seed OPRF rotation
 
 ### 2.3 Out of Scope
 
@@ -73,13 +74,13 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - Email or OAuth registration
 - Anonymous accounts
 - Plaintext message export
-- Username changes (usernames are immutable)
+- Username changes
 - Third-party CAPTCHA services
-- Client-side data deletion (client responsibility)
-- Forcing peers to delete local message copies (impossible in E2EE)
-- Consent management UI (client responsibility)
+- Client-side data deletion
+- Forcing peers to delete local copies
+- Consent management UI
 - TLS termination inside the Axum process
-- ACME/Let's Encrypt client inside the server
+- ACME client inside the server
 
 ---
 
@@ -107,7 +108,7 @@ The client is delivered as a separate package (`client/`) and is not covered by 
 - **Messenger mode (default):** Only room owner can kick. Moderators cannot exist.
 - **Discord mode (optional):** Room owner can promote members to moderators. Moderators can kick.
 
-Toggled per-instance via `MODERATION_MODE`. The setting is live and applies to all rooms retroactively. The `moderation_override` column exists in the `rooms` table for future per-room exceptions but is unused in V1.
+Toggled per-instance via `MODERATION_MODE`. Live and applies to all rooms retroactively.
 
 ### 3.4 Enforcement Order
 
@@ -115,14 +116,12 @@ Every API call checks:
 1. Global permission for the action
 2. Room role for the target room (if applicable)
 
-Effective privilege is the union.
-
 ### 3.5 Room Ownership Transfer
 
-- Owner can explicitly transfer ownership to any other room member.
-- If owner leaves without transferring, ownership passes to the longest-tenured moderator, or to the longest-tenured member if no moderators exist.
+- Owner can explicitly transfer ownership to any other member.
+- If owner leaves without transferring, ownership passes to the longest-tenured moderator, or to the longest-tenured member.
 - If the room has no other members, it is deleted.
-- Instance admins can force-transfer ownership via the admin API.
+- Instance admins can force-transfer ownership.
 
 ---
 
@@ -166,20 +165,20 @@ All cleanup jobs run on a shared hourly scheduler.
 
 | Job | Retention | Notes |
 |---|---|---|
-| Session cleanup | `expires_at < now() - 30 days` OR `revoked_at < now() - 30 days` | Preserves active and recently-expired sessions |
-| Rate limit table | Entries older than 24 hours | Longest rate window is daily |
-| Audit log | 90 days (configurable via `AUDIT_RETENTION_DAYS`) | Compliance-aligned default |
-| Attachment pruning | Per-room retention, falling to instance default, then server hard max | Respects three-tier limits |
-| Welcome expiry | 7 days | Stale welcomes deleted; room admin must re-issue |
-| Message retention | Per-room `retention_days`, falling to instance default | Deletes messages from Sockudo history and DB references |
-| Registration state | 5-minute TTL, purged opportunistically on insert | In-memory only, lost on restart |
-| Login state | 5-minute TTL, purged opportunistically on insert | In-memory only, lost on restart |
+| Session cleanup | 30 days after expiry or revocation | Preserves active and recently-expired sessions |
+| Rate limit table | 24 hours | Longest rate window is daily |
+| Audit log | `AUDIT_RETENTION_DAYS` (default 90) | Compliance-aligned default |
+| Attachment pruning | Three-tier effective retention | Deletes row and blob |
+| Welcome expiry | 7 days | Stale welcomes deleted |
+| Message retention | Per-room, falling to instance default | Deletes messages from Sockudo history and DB |
+| Registration state | 5-minute TTL | In-memory, opportunistic purge |
+| Login state | 5-minute TTL | In-memory, opportunistic purge |
 
 ---
 
 ## 5. Environment Variables
 
-Follows Coolify conventions. All variables are optional unless marked **required**. Defaults are applied at startup.
+Follows Coolify conventions. All variables are optional unless marked **required**.
 
 ### 5.1 Application
 
@@ -194,12 +193,12 @@ CLIENT_STATIC_DIR=/app/client
 | Variable | Default | Notes |
 |---|---|---|
 | `APP_ENV` | `production` | `production` or `development` |
-| `APP_URL` | — | **Required.** Public URL of the deployment. Must begin with `https://` when `APP_ENV=production`. Server refuses to start otherwise. |
+| `APP_URL` | — | **Required.** Must begin with `https://` in production. |
 | `APP_NAME` | `Encrypted Chat` | Display name |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error` |
-| `CLIENT_STATIC_DIR` | — | Optional. When set, Axum serves the SPA from this directory with an SPA fallback. When unset, static serving is disabled (development mode where the Coralite dev server runs separately). |
+| `CLIENT_STATIC_DIR` | — | Optional. When set, Axum serves the SPA from this directory. |
 
-**Startup validation:** In production, `APP_URL` must start with `https://`. The server exits with a fatal error if the scheme is `http://`. In development, `http://` is permitted.
+**Startup validation:** In production, `APP_URL` must start with `https://`. The server exits on mismatch.
 
 ### 5.2 Server
 
@@ -208,22 +207,12 @@ SERVER_BIND=0.0.0.0:8080
 SERVER_WORKERS=4
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `SERVER_BIND` | `0.0.0.0:8080` | Axum bind address |
-| `SERVER_WORKERS` | CPU count | Tokio worker threads |
-
 ### 5.3 Database
 
 ```env
 DB_PATH=/data/app.db
 DB_BUSY_TIMEOUT_MS=5000
 ```
-
-| Variable | Default | Notes |
-|---|---|---|
-| `DB_PATH` | `/data/app.db` | SQLite file path |
-| `DB_BUSY_TIMEOUT_MS` | `5000` | SQLite `busy_timeout` PRAGMA |
 
 ### 5.4 Sessions
 
@@ -232,14 +221,7 @@ SESSION_EXPIRY_DAYS=30
 SESSION_SLIDING=true
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `SESSION_EXPIRY_DAYS` | `30` | Absolute expiry |
-| `SESSION_SLIDING` | `true` | Activity refreshes expiry |
-
 ### 5.5 Server Hard Limits
-
-Absolute ceilings. Nothing can exceed them at runtime.
 
 ```env
 SERVER_MAX_FILE_SIZE_BYTES=104857600
@@ -261,19 +243,12 @@ RATE_KP_CLAIM_PER_MIN=30
 RATE_KP_CLAIM_HOURLY=200
 RATE_LOGIN_PER_MIN=10
 RATE_LOGIN_LOCKOUT_MIN=15
+RATE_PRESIGN_PER_MIN=60
 ```
 
 | Variable | Default | Notes |
 |---|---|---|
-| `RATE_INVITE_CREATE_HOURLY` | `50` | Invites created per user per hour |
-| `RATE_INVITE_CREATE_DAILY` | `200` | Invites created per user per day |
-| `RATE_INVITE_REDEEM_PER_MIN` | `10` | Redemption attempts per IP per minute |
-| `RATE_KP_CLAIM_PER_MIN` | `30` | KeyPackage claims per user per minute |
-| `RATE_KP_CLAIM_HOURLY` | `200` | KeyPackage claims per user per hour |
-| `RATE_LOGIN_PER_MIN` | `10` | Login attempts per IP per minute |
-| `RATE_LOGIN_LOCKOUT_MIN` | `15` | Lockout duration after threshold |
-
-Rate limit state is stored in a SQLite table and pruned hourly (entries older than 24 hours).
+| `RATE_PRESIGN_PER_MIN` | `60` | Presigned URL generation per user per minute |
 
 ### 5.7 Transport Security
 
@@ -287,21 +262,11 @@ HSTS_INCLUDE_SUBDOMAINS=true
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CORS_ALLOWED_ORIGINS` | empty (dev: `*`) | Comma-separated list of allowed origins |
+| `CORS_ALLOWED_ORIGINS` | empty (dev: `*`) | Comma-separated list |
 | `CSRF_PROTECTION` | `none` | `none`, `header`, `double-submit` |
-| `TRUST_PROXY` | `false` | Trust `X-Forwarded-Proto`, `X-Forwarded-For`, `X-Real-IP`. Set to `true` behind a reverse proxy. |
-| `HSTS_MAX_AGE` | `31536000` | HSTS max-age in seconds (1 year). Set to `0` to disable HSTS. |
-| `HSTS_INCLUDE_SUBDOMAINS` | `true` | Only disable if the domain is shared with non-HTTPS services. |
-
-**CORS:** In production, `CORS_ALLOWED_ORIGINS` must be set. In development, it defaults to `*` with a startup warning.
-
-**CSRF:** Bearer-token auth does not require CSRF protection. The `CSRF_PROTECTION` variable exists to support future cookie-based sessions. V1 uses `none`.
-
-The server rejects requests with an `Origin` header not in the allowed list, even for non-CORS requests. Origin mismatches are logged at `warn` level.
-
-**Trust proxy:** When `TRUST_PROXY=false`, the server ignores all forwarding headers. This is safe when the server is not behind a proxy, but produces wrong redirects when it is. When `TRUST_PROXY=true`, the server trusts `X-Forwarded-Proto` to determine the client's scheme and `X-Forwarded-For` for IP-based rate limiting.
-
-**HSTS:** Only sent on HTTPS responses. When `HSTS_MAX_AGE=0`, the header is omitted entirely. The `preload` directive is never set — preloading requires submitting the domain to a browser-managed list, which is inappropriate for self-hosted deployments.
+| `TRUST_PROXY` | `false` | Trust `X-Forwarded-*` headers |
+| `HSTS_MAX_AGE` | `31536000` | 1 year. `0` disables |
+| `HSTS_INCLUDE_SUBDOMAINS` | `true` | Disable only if domain is shared |
 
 ### 5.8 OPAQUE
 
@@ -311,27 +276,25 @@ OPAQUE_OPRF_KEY_PATH=/data/oprf.key
 
 | Variable | Default | Notes |
 |---|---|---|
-| `OPAQUE_OPRF_KEY_PATH` | `/data/oprf.key` | Path to the persisted `ServerSetup` (OPRF seed + server static keypair) |
+| `OPAQUE_OPRF_KEY_PATH` | `/data/oprf.key` | Path to the persisted `ServerSetup` |
 
-**Crate:** `opaque-ke` 4.0.1, feature `argon2`.
+**Crate:** `opaque-ke` 4.0.1, feature `argon2`. Rust minimum 1.85.
 
-**Rust minimum:** 1.85.
-
-**Cipher suite:** Defined in `server/src/opaque.rs` as `DefaultCipherSuite`. The suite composes:
+**Cipher suite:** `DefaultCipherSuite` in `server/src/opaque.rs`:
 
 | Component | Value |
 |---|---|
 | OPRF group | `Ristretto255` |
 | Key exchange | `TripleDh<Ristretto255, Sha512>` |
-| Key stretching function (KSF) | Argon2 (via `opaque_ke::ksf::Argon2`) |
+| KSF | Argon2 |
 
-The cipher suite is bound to every stored user registration record. Changing the suite, the crate major version, or the KSF parameters invalidates all existing user registrations. Do not change without a spec revision and documented migration path.
+The cipher suite is bound to every stored user registration. Do not change without a spec revision and migration path.
 
-**Server setup persistence:** The `ServerSetup` is serialized to the file at `OPAQUE_OPRF_KEY_PATH` on first startup and reused on every subsequent startup. The file must have `0600` permissions on Unix. Loss of this file invalidates all existing user registrations — there is no recovery path.
+**Server setup persistence:** Serialized to `OPAQUE_OPRF_KEY_PATH` on first startup. Must be `0600` on Unix. Loss invalidates all user registrations.
 
-**OPRF seed rotation:** The OPRF seed is a long-lived secret. It is not rotated on a schedule. Rotation occurs only on suspected compromise or cryptographic migration, and requires forced re-registration of all users. There is no graceful rotation path in V1.
+**OPRF seed rotation:** Long-lived secret. Rotated only on suspected compromise or cryptographic migration, requiring forced re-registration of all users.
 
-The multi-seed mechanism from the 2026 OPAQUE-with-OPRF-key-rotation paper is reserved for V2, contingent on `opaque-ke` exposing multi-seed support. `opaque-ke` 4.0.1 added remote OPRF seed support, which is a prerequisite for that work.
+The multi-seed mechanism is reserved for V2, contingent on `opaque-ke` exposing multi-seed support.
 
 ### 5.9 Backups
 
@@ -345,13 +308,9 @@ BACKUP_INCLUDE_ATTACHMENTS=false
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BACKUP_ENABLED` | `true` | Master switch |
-| `BACKUP_PATH` | `/data/backups` | Backup destination |
-| `BACKUP_INTERVAL_HOURS` | `24` | Snapshot interval |
-| `BACKUP_RETENTION_COUNT` | `30` | Snapshots to retain |
-| `BACKUP_INCLUDE_ATTACHMENTS` | `false` | Include encrypted blobs |
+| `BACKUP_INCLUDE_ATTACHMENTS` | `false` | Include S3/filesystem blobs |
 
-**Backup encryption key:** Derived from the same root secret as the OPRF seed via HKDF with a distinct `info` string:
+**Backup encryption key:** Derived from the same root secret as the OPRF seed via HKDF:
 
 ```
 root_secret = random 32 bytes, stored at OPAQUE_OPRF_KEY_PATH
@@ -359,9 +318,7 @@ oprf_seed   = HKDF(root_secret, info="opaque-oprf-v1")
 backup_key  = HKDF(root_secret, info="backup-encryption-v1")
 ```
 
-One root secret, two derived keys. Compromise of the backup key does not compromise the OPRF, and vice versa. Rotation of the root secret requires re-registration of all users and re-encryption of all backups.
-
-**Restore procedure:** CLI only. `server restore --from <path> --confirm`. The API can list backups and trigger new ones but cannot restore them. Restore requires shell access and explicit confirmation.
+**Restore procedure:** CLI only. `server restore --from <path> --confirm`.
 
 ### 5.10 Push Notifications
 
@@ -376,20 +333,9 @@ PUSH_FCM_SERVICE_ACCOUNT_JSON=
 PUSH_GATEWAY_URL=
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `PUSH_ENABLED` | `true` | Master switch |
-| `PUSH_VAPID_PUBLIC_KEY` | `auto` | Generated on first startup |
-| `PUSH_VAPID_PRIVATE_KEY` | `auto` | Generated on first startup |
-| `PUSH_APNS_KEY` | — | Required to enable iOS push |
-| `PUSH_APNS_KEY_ID` | — | Required to enable iOS push |
-| `PUSH_APNS_TEAM_ID` | — | Required to enable iOS push |
-| `PUSH_FCM_SERVICE_ACCOUNT_JSON` | — | Required to enable Android push |
-| `PUSH_GATEWAY_URL` | — | UnifiedPush-compatible endpoint |
+**VAPID keys:** Generated on first startup, stored in `instance_config`, included in backups.
 
-**VAPID key management:** VAPID keys are generated on first startup and stored in `instance_config`. They are included in every backup. If regenerated (via admin API only), all existing `push_subscriptions` are marked revoked, an audit event is logged, and clients re-register on next session. There is no silent recovery.
-
-**Push suppression:** Before sending a push, the server checks whether the target device has a recent live session for the target conversation. If it does, the push is suppressed for that device. This is per-device, not per-user — a user with phone and laptop receives phone push even if the laptop is active.
+**Push suppression:** Per-device. Suppress push for a device with a recent live session.
 
 ### 5.11 ALTCHA
 
@@ -400,34 +346,81 @@ ALTCHA_ALGORITHM=PBKDF2/SHA-256
 ALTCHA_COST=5000
 ```
 
+**Crate:** `altcha` 0.2.0 or later.
+
+**Effort mode:** Deterministic only. HMAC secret on both creation and verification. Probabilistic mode and deterministic mode without HMAC are prohibited (July 2026 advisory).
+
+**Protection scope:** `POST /auth/register/start` and `POST /auth/register/finish`.
+
+### 5.12 Storage Backend
+
+```env
+STORAGE_BACKEND=fs
+```
+
+**Values:** `fs` (default) or `s3`.
+
+**Filesystem backend:**
+
+```env
+STORAGE_FS_PATH=./data/attachments
+```
+
+**S3 backend:**
+
+```env
+S3_ENDPOINT=https://s3.amazonaws.com
+S3_REGION=us-east-1
+S3_BUCKET=my-chat-blobs
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+S3_PATH_STYLE=false
+S3_PRESIGN_TTL_SECONDS=600
+```
+
 | Variable | Default | Notes |
 |---|---|---|
-| `ALTCHA_ENABLED` | `true` | Master switch. When `false`, the challenge endpoint returns 404 and registration skips validation. |
-| `ALTCHA_HMAC_SECRET` | `auto` | Generated on first startup and stored in `instance_config` under `altcha_hmac_secret`. |
-| `ALTCHA_ALGORITHM` | `PBKDF2/SHA-256` | KDF algorithm. |
-| `ALTCHA_COST` | `5000` | KDF iteration count. |
+| `S3_ENDPOINT` | — | Required for S3 backend |
+| `S3_REGION` | `us-east-1` | Region string |
+| `S3_BUCKET` | — | Required for S3 backend |
+| `S3_ACCESS_KEY_ID` | — | Required for S3 backend |
+| `S3_SECRET_ACCESS_KEY` | — | Required for S3 backend |
+| `S3_PATH_STYLE` | `false` | Set `true` for MinIO and most self-hosted S3-compatible services |
+| `S3_PRESIGN_TTL_SECONDS` | `600` | Presigned URL lifetime (10 minutes) |
 
-**Crate:** `altcha` 0.2.0 or later. Version 0.1.0 is not permitted.
+**S3 crate:** `rust-s3`. Selected over `aws-sdk-s3` for binary size (~445 KB vs ~14 MB) and simpler configuration. Streaming is not required — attachments are capped at 100 MB and buffered in memory during a single fetch.
 
-**Effort mode:** Deterministic only. The HMAC signature secret is set on both challenge creation and verification. Probabilistic mode and deterministic mode without the HMAC secret are not permitted. This restriction exists because of the July 2026 ALTCHA advisory that affected the fallback verification branch.
+**Backend selection:** At startup, the server initializes the storage backend based on `STORAGE_BACKEND`. Missing required variables cause startup failure with a clear error.
 
-**Purpose:** ALTCHA provides bot resistance on registration endpoints without third-party services, user tracking, or image puzzles. It is a validation layer that runs before the OPAQUE handshake. It does not modify the OPAQUE protocol.
+**Filesystem layout:** Blobs are stored at `{STORAGE_FS_PATH}/{id[0..2]}/{id[2..4]}/{id}` where `id` is a 64-character hex string. Two-level sharding prevents directory bloat.
 
-**Protection scope:** ALTCHA protects `POST /api/v1/auth/register/start` and `POST /api/v1/auth/register/finish`. It does not protect login, invite redemption, or any other endpoint.
+**S3 key layout:** Blobs are stored at `attachments/{id[0..2]}/{id[2..4]}/{id}`. The same sharding applies.
 
-**Secret persistence:** The HMAC secret is stored in `instance_config`. Loss of the secret invalidates in-flight challenges only — no persistent state depends on it.
+### 5.13 Attachment Format
 
-### 5.12 Moderation
+```env
+ATTACHMENT_CHUNK_SIZE=65536
+ATTACHMENT_BUCKET_SIZES=65536,524288,4194304,33554432
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ATTACHMENT_CHUNK_SIZE` | `65536` | Plaintext bytes per AES-GCM chunk (64 KB) |
+| `ATTACHMENT_BUCKET_SIZES` | `65536,524288,4194304,33554432` | Padded size buckets for upload |
+
+**Chunk size:** Fixed at 64 KB. Do not change without a spec revision — the value is embedded in every stored attachment's manifest.
+
+**Bucket sizes:** Comma-separated list. Must be strictly increasing. Each value must be a multiple of `ATTACHMENT_CHUNK_SIZE` plus 16 bytes per chunk (the GCM tag overhead).
+
+**Padding:** The client pads the encrypted blob to the nearest bucket. The server verifies the padded size matches a bucket and rejects uploads that do not.
+
+### 5.14 Moderation
 
 ```env
 MODERATION_MODE=messenger
 ```
 
-| Variable | Default | Options |
-|---|---|---|
-| `MODERATION_MODE` | `messenger` | `messenger`, `discord` |
-
-### 5.13 Invite Defaults
+### 5.15 Invite Defaults
 
 ```env
 INVITE_DEFAULT_USES=1
@@ -435,37 +428,23 @@ INVITE_EXPIRY_DAYS=0
 INVITE_CODE_LENGTH=8
 INVITE_LIMITED_MAX_USES=10
 INVITE_LIMITED_MAX_OPEN=50
+ROOM_INVITE_DEFAULT_USES=1
+ROOM_INVITE_CODE_LENGTH=8
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `INVITE_DEFAULT_USES` | `1` | `0` = unlimited |
-| `INVITE_EXPIRY_DAYS` | `0` | `0` = never expires |
-| `INVITE_CODE_LENGTH` | `8` | Crockford Base32 length |
-| `INVITE_LIMITED_MAX_USES` | `10` | Max `max_uses` for `invite.limited` users |
-| `INVITE_LIMITED_MAX_OPEN` | `50` | Max open invites for `invite.limited` users |
-
-### 5.14 Safety Numbers
+### 5.16 Safety Numbers
 
 ```env
 SAFETY_NUMBER_MODE=warn
 ```
 
-| Variable | Default | Options |
-|---|---|---|
-| `SAFETY_NUMBER_MODE` | `warn` | `warn`, `block`, `off` |
-
-### 5.15 Audit Log
+### 5.17 Audit Log
 
 ```env
 AUDIT_RETENTION_DAYS=90
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `AUDIT_RETENTION_DAYS` | `90` | Entries older than this are pruned daily. `0` disables pruning. |
-
-### 5.16 Cleanup Scheduler
+### 5.18 Cleanup Scheduler
 
 ```env
 CLEANUP_ENABLED=true
@@ -473,13 +452,7 @@ CLEANUP_INTERVAL_MINUTES=60
 CLEANUP_STARTUP_DELAY_SECS=30
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `CLEANUP_ENABLED` | `true` | Master switch |
-| `CLEANUP_INTERVAL_MINUTES` | `60` | Cycle interval |
-| `CLEANUP_STARTUP_DELAY_SECS` | `30` | Delay before first cycle |
-
-### 5.17 Sockudo
+### 5.19 Sockudo
 
 ```env
 SOCKUDO_URL=http://sockudo:6001
@@ -488,126 +461,193 @@ SOCKUDO_APP_KEY=auto
 SOCKUDO_APP_SECRET=auto
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `SOCKUDO_URL` | — | **Required.** Sockudo HTTP API base. Internal URL; not exposed to clients. |
-| `SOCKUDO_APP_ID` | `chat` | App identifier |
-| `SOCKUDO_APP_KEY` | `auto` | Generated if `auto`, stored in `instance_config` |
-| `SOCKUDO_APP_SECRET` | `auto` | Generated if `auto`, stored in `instance_config` |
-
-The **external** WebSocket URL is derived from `APP_URL`:
+External WebSocket URL is derived from `APP_URL`:
 
 ```
 wss_url = APP_URL.replace("https://", "wss://") + "/realtime"
 ```
 
-Clients connect to the external WSS URL. The reverse proxy terminates TLS and forwards plain WebSocket frames to `SOCKUDO_URL`.
-
-### 5.18 GDPR
+### 5.20 GDPR
 
 ```env
 DATA_RETENTION_DAYS=0
 EXPORT_RATE_LIMIT_HOURS=24
 ```
 
-| Variable | Default | Notes |
-|---|---|---|
-| `DATA_RETENTION_DAYS` | `0` | `0` = retain forever. When set, server-visible message metadata is purged after this window. |
-| `EXPORT_RATE_LIMIT_HOURS` | `24` | Minimum interval between data export requests |
+### 5.21 TLS Termination
 
-### 5.19 TLS Termination
+TLS terminates at a reverse proxy. The Axum server listens on plain HTTP internally.
 
-TLS terminates at a **reverse proxy**, not in the Axum process. The server listens on plain HTTP internally and relies on the proxy to present a valid certificate to clients.
+**Coolify deployments:** Traefik handles certificates automatically.
 
-**Coolify deployments:** Traefik is the edge proxy. Certificates are provisioned automatically via Let's Encrypt. No manual TLS configuration is required.
+**Manual deployments:** Caddy recommended.
 
-**Manual deployments:** Caddy is the recommended proxy. A minimal `Caddyfile`:
-
-```
+```caddyfile
 chat.example.com {
-    reverse_proxy server:8080
-    reverse_proxy /realtime* sockudo:6001
+    reverse_proxy /api/* server:8080
+    reverse_proxy /health server:8080
+    reverse_proxy /ready server:8080
+    reverse_proxy /realtime/* sockudo:6001
+    reverse_proxy * server:8080
 }
 ```
 
-Caddy provisions certificates automatically. Nginx and other proxies work equally well but require manual certificate management.
-
-**Client-facing URLs:**
-- The SPA loads from `APP_URL` (HTTPS).
-- API requests go to `APP_URL/api/v1/*` (HTTPS).
-- WebSocket connections go to `wss://<APP_URL host>/realtime` (WSS).
-
-The Axum server never sees the client's TLS connection directly. It sees plain HTTP from the proxy on the internal Docker network.
-
 **What the application enforces:**
-1. `APP_URL` must begin with `https://` when `APP_ENV=production`. Startup fails otherwise.
-2. Requests with `X-Forwarded-Proto: http` are redirected to HTTPS with a 301 when `TRUST_PROXY=true`.
+1. `APP_URL` must begin with `https://` in production.
+2. Requests with `X-Forwarded-Proto: http` are redirected to HTTPS with 301.
 3. HSTS is sent on HTTPS responses.
 
-See §8.0 for the middleware implementation.
+See §8.0 for middleware details.
 
 ---
 
 ## 6. Client Interface Contract
 
-This section describes what the **server requires from clients**. It is not an implementation guide. Client code lives in `client/` and has its own specification.
+What the **server requires from clients**. Not an implementation guide.
 
 ### 6.1 Authentication
 
-- Clients send `Authorization: Bearer <session_token>` on every authenticated request.
-- The session token is obtained from `POST /api/v1/auth/login/finish`.
-- Tokens are 43-character base64url strings. Clients must not parse or modify them.
+- `Authorization: Bearer <session_token>` on every authenticated request.
+- Tokens are 43-character base64url strings.
 
-### 6.2 OPAQUE Handshake Order
+### 6.2 OPAQUE Handshake
 
-- Registration: `POST /auth/register/start` then `POST /auth/register/finish`.
-- Login: `POST /auth/login/start` then `POST /auth/login/finish`.
-- Clients must complete both rounds within 5 minutes or the correlation state expires.
+- Registration: `start` then `finish`. Both within 5 minutes.
+- Login: `start` then `finish`. Both within 5 minutes.
 
-### 6.3 ALTCHA Payload Format
+### 6.3 ALTCHA Payload
 
-- Clients submit a base64-encoded JSON payload in the `altcha` field.
-- The payload is produced by the ALTCHA widget after solving a challenge from `GET /auth/register/challenge`.
+- Base64-encoded JSON in the `altcha` field.
+- Produced by the ALTCHA widget after solving a challenge.
 
 ### 6.4 MLS Message Envelope
 
-- Clients encrypt and decrypt MLS messages locally. The server never inspects MLS state.
+- Clients encrypt/decrypt MLS locally. Server never inspects MLS state.
 - Message payloads are base64-encoded MLS ciphertexts.
-- Padding to fixed buckets (256 B, 1 KB, 4 KB, 16 KB) is a client responsibility.
+- Padding to fixed buckets (256 B, 1 KB, 4 KB, 16 KB) is client-side.
 
-### 6.5 Attachments
+### 6.5 Attachments — Encryption Format
 
-- Clients encrypt attachments before upload with a per-file ephemeral key.
-- The blob is content-addressed: the SHA-256 of the ciphertext is the blob ID.
-- The ephemeral key and nonce are embedded in the MLS message envelope.
-- Clients verify the SHA-256 hash of the downloaded blob before decrypting.
+Attachments use **chunked AES-256-GCM** with the following wire format:
 
-### 6.6 Room Membership
+```
+Header (23 bytes):
+  version        (1 byte, currently 0x01)
+  nonce_prefix   (7 bytes, random)
+  chunk_size     (4 bytes, big-endian, plaintext bytes per chunk)
+  chunk_count    (8 bytes, big-endian, total number of chunks)
+  reserved       (3 bytes, zero)
 
-- Room membership is server-visible at the user level (`room_members`).
+Chunk 0:
+  ciphertext_0   (up to chunk_size bytes)
+  auth_tag_0     (16 bytes)
+
+Chunk 1:
+  ciphertext_1
+  auth_tag_1
+
+...
+Chunk N-1:
+  ciphertext_N-1
+  auth_tag_N-1
+  (last chunk may be shorter than chunk_size)
+```
+
+**IV derivation for chunk `i`:**
+
+```
+IV_i = nonce_prefix (7 bytes) || counter_bytes (4 bytes) || 0x00
+counter_bytes = base_counter XOR i
+```
+
+Where `base_counter` is a random 32-bit value stored in the header. This lets the client derive any chunk's IV independently — a requirement for seeking.
+
+**Additional authenticated data (AAD):**
+
+```
+AAD_i = version || chunk_count || i || is_last
+```
+
+Where `is_last` is `1` for the final chunk, `0` otherwise. This binds each chunk to its position and prevents truncation attacks.
+
+**Manifest (embedded in the MLS message):**
+
+```json
+{
+  "file_id": "<sha256 hex of the whole padded ciphertext>",
+  "key": "<base64, 32 bytes>",
+  "nonce_prefix": "<base64, 7 bytes>",
+  "base_counter": 12345,
+  "chunk_size": 65536,
+  "chunk_count": 1600,
+  "plaintext_size": 104857600,
+  "encrypted_size": 104883216,
+  "content_type": "video/mp4",
+  "filename_encrypted": "<base64>"
+}
+```
+
+The manifest is inside the MLS application message. The server never sees it.
+
+### 6.6 Attachments — Padding
+
+After chunked encryption, the client pads the ciphertext to the nearest bucket from `ATTACHMENT_BUCKET_SIZES`. The padding is added as a final chunk encrypted with the same key and an IV derived for chunk index `chunk_count`. The last chunk flag is set on the padded final chunk.
+
+**Alternative padding:** The client may pad the plaintext before encryption so that the encrypted size naturally lands within a bucket. Either approach works; the server only checks that the total uploaded size equals a bucket value.
+
+### 6.7 Attachments — Upload
+
+- The client uploads the entire padded ciphertext as a single object.
+- The `file_id` is the SHA-256 of the **padded ciphertext**, not the plaintext.
+- The server verifies the hash before storing.
+
+### 6.8 Attachments — Streaming and Seeking
+
+- The client decides whether to fetch all chunks at once or lazily based on file size and MIME type.
+- **Recommended threshold:** files ≤ 1 MB are fetched in a single request; files > 1 MB are fetched lazily.
+- **Media (audio/video):** always fetched lazily, regardless of size.
+- The client maps plaintext ranges to encrypted ranges and issues `Range` requests.
+- The server translates and serves ranges without knowledge of playback position.
+
+### 6.9 Attachments — Presigned URLs
+
+- For S3 backends, the client fetches ranges directly from S3 using presigned URLs.
+- The client requests a fresh URL per seek operation. Do not cache presigned URLs.
+- Presigned URLs support `Range` headers natively.
+- The client must handle URL expiry mid-download by requesting a new URL and resuming.
+
+### 6.10 Attachments — MP4 Streaming
+
+For MP4 files to stream and seek properly:
+
+- The `moov` atom must be at the **beginning** of the file ("fast-start MP4").
+- The client must validate this before upload and reject or re-encode files that are not fast-start.
+- This is a container-format constraint, not an encryption constraint.
+
+### 6.11 Room Membership
+
+- Room membership is server-visible at the user level.
 - MLS leaf-level membership is client-visible only.
 
-### 6.7 Push Subscriptions
+### 6.12 Push Subscriptions
 
-- Clients register push subscriptions via `POST /users/me/push-subscriptions`.
-- The `platform` field must be one of `web`, `ios`, `android`, `desktop`.
-- Web Push subscriptions include `endpoint`, `p256dh`, `auth`, and `browser_id`.
-- Native subscriptions include `push_token` only.
+- Register via `POST /users/me/push-subscriptions`.
+- `platform` must be `web`, `ios`, `android`, or `desktop`.
 
-### 6.8 Safety Numbers
+### 6.13 Safety Numbers
 
 - Clients compute and display safety numbers out-of-band.
 - The server never sees safety numbers.
 
-### 6.9 WebSocket Connection
+### 6.14 WebSocket Connection
 
-- Clients connect to the URL advertised in `GET /api/v1/capabilities` (`websocket_url`).
-- In production this is always `wss://`.
-- In development this may be `ws://`.
+- Connect to the URL advertised in `GET /api/v1/capabilities` (`websocket_url`).
+- Production: always `wss://`.
 
-### 6.10 Client Capability Requirements
+### 6.15 Client Capability Requirements
 
-The server advertises capabilities via `GET /api/v1/capabilities`. Clients must read this on startup and degrade gracefully if a capability is unavailable.
+- Read `GET /api/v1/capabilities` on startup.
+- Degrade gracefully if a capability is unavailable.
 
 ---
 
@@ -666,12 +706,6 @@ CREATE TABLE sessions (
     last_seen_at DATETIME
 );
 ```
-
-**Username:** immutable, unique, 3–32 characters, alphanumeric plus underscore and dash.
-
-**Display name:** mutable, 1–64 characters, any printable Unicode. Server-visible.
-
-**`deleted_at`:** Set when the user requests account deletion. The row is anonymised but retained for referential integrity.
 
 ### 7.2 Invites
 
@@ -776,20 +810,73 @@ CREATE TABLE pending_mls_removes (
 CREATE INDEX idx_pending_mls_removes_active
     ON pending_mls_removes(room_id, consumed_at)
     WHERE consumed_at IS NULL;
+
+CREATE TABLE room_messages (
+    id                        TEXT PRIMARY KEY,
+    room_id                   TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    sender_user_id            TEXT NOT NULL REFERENCES users(id),
+    sender_client_id          TEXT NOT NULL,
+    epoch                     INTEGER NOT NULL,
+    seq                       INTEGER NOT NULL,
+    content_type              TEXT NOT NULL CHECK(content_type IN ('application', 'commit', 'proposal')),
+    ciphertext                BLOB NOT NULL,
+    created_at                DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_room_messages_room_epoch_seq
+    ON room_messages(room_id, epoch, seq);
+
+CREATE INDEX idx_room_messages_room_created
+    ON room_messages(room_id, created_at DESC);
+
+CREATE INDEX idx_room_messages_sender
+    ON room_messages(sender_user_id, created_at DESC);
 ```
 
 ### 7.5 Attachments
 
 ```sql
 CREATE TABLE attachments (
-    id           TEXT PRIMARY KEY,
-    room_id      TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-    uploader_id  TEXT NOT NULL REFERENCES users(id),
-    padded_size  INTEGER NOT NULL,
-    blob_path    TEXT NOT NULL,
-    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    id                TEXT PRIMARY KEY,
+    room_id           TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    uploader_id       TEXT NOT NULL REFERENCES users(id),
+    uploader_client_id TEXT,
+    storage_backend   TEXT NOT NULL CHECK(storage_backend IN ('fs', 's3')),
+    storage_key       TEXT NOT NULL,
+    padded_size       INTEGER NOT NULL,
+    plaintext_size    INTEGER NOT NULL,
+    encrypted_size    INTEGER NOT NULL,
+    chunk_size        INTEGER NOT NULL,
+    chunk_count       INTEGER NOT NULL,
+    nonce_prefix      TEXT NOT NULL,
+    base_counter      INTEGER NOT NULL,
+    content_type      TEXT NOT NULL DEFAULT 'application/octet-stream',
+    created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX idx_attachments_room_created
+    ON attachments(room_id, created_at DESC);
+
+CREATE INDEX idx_attachments_uploader_created
+    ON attachments(uploader_id, created_at DESC);
+
+CREATE INDEX idx_attachments_created
+    ON attachments(created_at);
 ```
+
+**Column notes:**
+
+- `id` — SHA-256 hex of the padded ciphertext.
+- `storage_backend` — `'fs'` or `'s3'`. Set at upload time based on the active backend. Enables future migrations.
+- `storage_key` — path or S3 key. Derived from `id` but stored explicitly for backend flexibility.
+- `padded_size` — total bytes uploaded (a bucket value).
+- `plaintext_size` — original file size, before encryption.
+- `encrypted_size` — `padded_size`, but semantically distinct for clarity.
+- `chunk_size` — plaintext bytes per chunk (64 KB default).
+- `chunk_count` — number of chunks including padding.
+- `nonce_prefix` — base64 of the 7-byte prefix.
+- `base_counter` — 32-bit integer used for IV derivation.
+- `content_type` — client-supplied MIME type. Metadata only.
 
 ### 7.6 Push Subscriptions
 
@@ -816,10 +903,6 @@ CREATE UNIQUE INDEX idx_push_endpoint ON push_subscriptions(endpoint)
 CREATE UNIQUE INDEX idx_push_browser ON push_subscriptions(user_id, browser_id)
     WHERE browser_id IS NOT NULL;
 ```
-
-**Platform separation:** Web, iOS, Android, and desktop are separate rows.
-
-**Per-browser instance:** A single device can have multiple web subscriptions (Chrome, Firefox, Safari).
 
 ### 7.7 Instance Config & Ops
 
@@ -864,13 +947,16 @@ CREATE TABLE rate_limits (
 );
 ```
 
+`instance_config` stores VAPID keys, Sockudo credentials, ALTCHA HMAC secret, and other auto-generated per-instance secrets.
+
 ### 7.8 State Outside the Database
 
 | Path | Purpose | Notes |
 |---|---|---|
-| `OPAQUE_OPRF_KEY_PATH` | OPAQUE `ServerSetup` and root backup secret | Required. Loss invalidates all user registrations and all backups. |
+| `OPAQUE_OPRF_KEY_PATH` | OPAQUE `ServerSetup` and root backup secret | Required. Loss invalidates all user registrations and backups. |
 | `BACKUP_PATH` | Backup snapshots | Populated by the backup scheduler |
-| Blob storage root | Encrypted attachment blobs | Content-addressed; filesystem or S3 |
+| `STORAGE_FS_PATH` | Filesystem attachment blobs | Only when `STORAGE_BACKEND=fs` |
+| S3 bucket | S3 attachment blobs | Only when `STORAGE_BACKEND=s3` |
 
 The OPAQUE `ServerSetup` file must have `0600` permissions on Unix.
 
@@ -892,102 +978,9 @@ All routes prefixed with `/api/v1/`. Auth via `Authorization: Bearer <session_to
 
 ### 8.0 Static Client Hosting and HTTPS Enforcement
 
-#### Static SPA Hosting
+**Static SPA hosting:** When `CLIENT_STATIC_DIR` is set, Axum serves the SPA with `ServeDir` and a fallback to `index.html`. The `fallback_service` runs last.
 
-When `CLIENT_STATIC_DIR` is set, the Axum server serves the compiled Coralite SPA from that directory using `ServeDir` with an SPA fallback:
-
-```rust
-let spa = ServeDir::new(&config.client_static_dir)
-    .not_found_service(ServeFile::new(format!("{}/index.html", config.client_static_dir)));
-
-let app = Router::new()
-    .nest("/api/v1", api_routes)
-    .route("/health", get(health))
-    .route("/ready", get(ready))
-    .fallback_service(spa)
-    .layer(middleware::from_fn_with_state(state.clone(), enforce_https))
-    .with_state(state);
-```
-
-The `fallback_service` runs last. API routes and health checks are matched first. Deep links return `index.html` and the client-side router takes over.
-
-In development (`CLIENT_STATIC_DIR` unset), static serving is disabled and the Coralite dev server runs separately on port 3000.
-
-#### HTTPS Enforcement
-
-When `APP_ENV=production`, a middleware layer enforces HTTPS semantics:
-
-```rust
-async fn enforce_https(
-    State(config): State<Arc<Config>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let is_prod = config.app_env == "production";
-
-    if !is_prod {
-        return next.run(req).await;
-    }
-
-    // Health and readiness are exempt — orchestrators probe over plain HTTP.
-    let path = req.uri().path();
-    if path == "/health" || path == "/ready" {
-        return next.run(req).await;
-    }
-
-    let scheme = if config.trust_proxy {
-        req.headers()
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("https")
-    } else {
-        "https"  // no proxy trusted; assume proxy terminated TLS correctly
-    };
-
-    if scheme == "http" {
-        let location = format!(
-            "{}{}",
-            config.app_url,
-            req.uri().path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
-        );
-        return Response::builder()
-            .status(StatusCode::MOVED_PERMANENTLY)
-            .header("Location", location)
-            .body(Body::empty())
-            .unwrap_or_else(|_| Response::new(Body::empty()));
-    }
-
-    let mut response = next.run(req).await;
-
-    if config.hsts_max_age > 0 {
-        let mut hsts = format!("max-age={}", config.hsts_max_age);
-        if config.hsts_include_subdomains {
-            hsts.push_str("; includeSubDomains");
-        }
-        if let Ok(value) = HeaderValue::from_str(&hsts) {
-            response.headers_mut().insert(
-                HeaderName::from_static("strict-transport-security"),
-                value,
-            );
-        }
-    }
-
-    response
-}
-```
-
-**Behaviour summary:**
-
-- In development, no redirect, no HSTS.
-- In production with `TRUST_PROXY=true`, requests with `X-Forwarded-Proto: http` get a 301 redirect to the HTTPS URL.
-- In production with `TRUST_PROXY=false`, the server assumes the proxy is doing its job and does not redirect. A startup warning is logged if `TRUST_PROXY=false` in production.
-- `/health` and `/ready` are exempt — they are probed over plain HTTP by orchestrators on the internal network.
-
-**Reverse proxy requirement:** The reverse proxy MUST be configured to:
-1. Terminate TLS with a valid certificate.
-2. Set `X-Forwarded-Proto: https` on requests it forwards.
-3. Proxy `/api/*` and static assets to the Axum server on port 8080.
-4. Proxy `/realtime` (WebSocket) to Sockudo.
+**HTTPS enforcement:** In production, requests with `X-Forwarded-Proto: http` receive a 301 redirect. HSTS is sent on HTTPS responses. `/health` and `/ready` are exempt from redirect.
 
 ### 8.1 Public
 
@@ -1000,9 +993,9 @@ async fn enforce_https(
 | POST | `/auth/register/start` | OPAQUE registration start |
 | POST | `/auth/register/finish` | OPAQUE registration finish |
 | POST | `/auth/login/start` | OPAQUE login start |
-| POST | `/auth/login/finish` | OPAQUE login finish → session token |
-| POST | `/invites/redeem` | Validate and consume a server invite |
-| GET | `/invites/:code` | Public invite code validation |
+| POST | `/auth/login/finish` | OPAQUE login finish |
+| POST | `/invites/redeem` | Validate and consume server invite |
+| GET | `/invites/:code` | Public invite validation |
 
 **`GET /capabilities` response:**
 
@@ -1012,19 +1005,20 @@ async fn enforce_https(
   "calling": false,
   "push_vapid_public_key": null,
   "websocket_url": "wss://chat.example.com/realtime",
+  "sockudo_app_key": "abc123",
+  "sockudo_channel_prefix": "private-room-",
   "altcha": {
     "enabled": true,
     "algorithm": "PBKDF2/SHA-256",
     "cost": 5000
   },
+  "storage_backend": "s3",
+  "attachment_chunk_size": 65536,
+  "attachment_bucket_sizes": [65536, 524288, 4194304, 33554432],
   "safety_number_mode": "warn",
   "moderation_mode": "messenger"
 }
 ```
-
-The `websocket_url` is derived from `APP_URL`:
-- Production: `APP_URL` with `https://` replaced by `wss://`, plus `/realtime`.
-- Development: `ws://localhost:6001` or the value of `SOCKUDO_PUBLIC_URL` if set.
 
 ### 8.2 User
 
@@ -1033,9 +1027,9 @@ The `websocket_url` is derived from `APP_URL`:
 | POST | `/auth/logout` | Revoke session |
 | GET | `/users/me` | Current user |
 | PATCH | `/users/me` | Update profile |
-| DELETE | `/users/me` | Delete account (GDPR Art. 17) |
-| GET | `/users/me/export` | Export data (GDPR Art. 20) |
-| POST | `/users/lookup` | Exact username_hash lookup |
+| DELETE | `/users/me` | Delete account |
+| GET | `/users/me/export` | Export data |
+| POST | `/users/lookup` | Username lookup |
 | GET | `/users/me/devices` | List devices |
 | DELETE | `/users/me/devices/:id` | Revoke device |
 | GET | `/users/me/sessions` | List sessions |
@@ -1072,7 +1066,7 @@ The `websocket_url` is derived from `APP_URL`:
 | POST | `/rooms` | Create room |
 | GET | `/rooms` | List my rooms |
 | GET | `/rooms/:id` | Room metadata |
-| DELETE | `/rooms/:id` | Delete room (owner only) |
+| DELETE | `/rooms/:id` | Delete room |
 | POST | `/rooms/:id/leave` | Leave room |
 | POST | `/rooms/:id/transfer` | Transfer ownership |
 | GET | `/rooms/:id/members` | List members |
@@ -1083,6 +1077,7 @@ The `websocket_url` is derived from `APP_URL`:
 | POST | `/rooms/:id/invites` | Create room invite |
 | GET | `/rooms/:id/invites` | List room invites |
 | DELETE | `/rooms/:id/invites/:code` | Revoke room invite |
+| POST | `/rooms/join` | Join via invite code |
 
 ### 8.5 MLS & Messaging
 
@@ -1092,17 +1087,86 @@ The `websocket_url` is derived from `APP_URL`:
 | GET | `/keypackages/count` | Count unconsumed packages |
 | POST | `/keypackages/claim` | Atomically claim a KeyPackage |
 | GET | `/welcomes` | List pending welcomes |
+| GET | `/welcomes/:id` | Fetch a welcome |
 | POST | `/welcomes/:id/consume` | Mark welcome consumed |
-| POST | `/rooms/:id/messages` | Publish MLS ciphertext via Sockudo |
+| POST | `/rooms/:id/messages` | Submit MLS message |
+| GET | `/rooms/:id/messages` | List messages |
+| GET | `/rooms/:id/messages/:id/ciphertext` | Fetch message ciphertext |
 | GET | `/rooms/:id/epoch` | Current epoch and sequence |
+| GET | `/rooms/:id/pending-removes` | List pending MLS removes |
+| POST | `/rooms/:id/pending-removes/:id/consume` | Mark remove consumed |
+| POST | `/sockudo/auth` | Sign a channel subscription |
 
 ### 8.6 Attachments
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/attachments` | Upload encrypted blob |
-| GET | `/attachments/:hash` | Download by content hash |
-| DELETE | `/attachments/:hash` | Delete (uploader only) |
+| POST | `/rooms/:id/attachments` | Upload encrypted attachment |
+| GET | `/attachments/:id` | Download (supports `Range`) |
+| DELETE | `/attachments/:id` | Delete (uploader only) |
+| POST | `/attachments/:id/presign` | Generate a presigned URL (S3 only) |
+
+**Upload request:** `multipart/form-data` with a `file` part and a `claimed_id` field; or `application/octet-stream` with `X-Claimed-Id` header.
+
+**Upload response:**
+
+```json
+{
+  "id": "<sha256 hex>",
+  "room_id": "<room_id>",
+  "uploader_id": "<user_id>",
+  "padded_size": 65536,
+  "plaintext_size": 104857600,
+  "encrypted_size": 104883216,
+  "chunk_size": 65536,
+  "chunk_count": 1600,
+  "content_type": "video/mp4",
+  "created_at": "<ISO 8601>"
+}
+```
+
+**Download:** Standard `GET` returns the whole blob. With `Range: bytes=N-M`, returns `206 Partial Content` with the translated encrypted range. The client decrypts the chunks in that range. Headers:
+
+```
+Content-Type: application/octet-stream
+Content-Length: <range length>
+Content-Range: bytes N-M/total
+Cache-Control: private, max-age=86400, immutable
+ETag: "<id>"
+X-Attachment-Content-Type: <content_type>
+X-Attachment-Chunk-Size: 65536
+X-Attachment-Plaintext-Size: 104857600
+X-Attachment-Nonce-Prefix: <base64>
+X-Attachment-Base-Counter: <int>
+X-Content-Type-Options: nosniff
+```
+
+**Presign request:**
+
+```json
+{
+  "range_start": 0,
+  "range_end": 65535,
+  "expires_in_seconds": 600
+}
+```
+
+**Presign response:**
+
+```json
+{
+  "url": "https://s3.example.com/...",
+  "expires_at": "<ISO 8601>",
+  "range_start": 0,
+  "range_end": 65535
+}
+```
+
+The presigned URL supports range requests. The client fetches directly from S3, bypassing the Axum server for blob traffic.
+
+**Presign is only available when `STORAGE_BACKEND=s3`.** For filesystem, the client uses `GET /attachments/:id` with a `Range` header.
+
+**Rate limit:** `RATE_PRESIGN_PER_MIN` per user.
 
 ---
 
@@ -1116,26 +1180,27 @@ The `websocket_url` is derived from `APP_URL`:
 | `server rotate-vapid` | Rotate VAPID keys |
 | `server rotate-altcha` | Rotate ALTCHA HMAC secret |
 | `server rotate-oprf --confirm` | Resample the OPRF seed |
+| `server storage migrate --from fs --to s3` | Migrate attachment blobs between backends |
 
 ---
 
 ## 10. Client Contract Matrix
 
-This matrix describes **server behaviour** for features the client relies on. Client-side implementation is not specified here.
-
 | Feature | Server behaviour |
 |---|---|
 | Text messaging | Relays MLS ciphertext via Sockudo; never inspects content |
-| Attachments | Content-addressed blob storage; server stores ciphertext only |
-| Push notifications | Accepts subscriptions for `web`, `ios`, `android`, `desktop`; suppresses per-device based on recent live session |
-| Multi-device | Supports up to `devices_per_user` (default 10); each device has an independent `client_id` |
+| Attachments | Content-addressed, chunked AES-GCM, supports range requests |
+| Attachment streaming | Server supports `Range` headers on download; presigned URLs for S3 |
+| Push notifications | Accepts `web`, `ios`, `android`, `desktop`; suppresses per-device |
+| Multi-device | Up to `devices_per_user` (default 10) |
 | Safety numbers | Advisory only; server never sees them |
 | ALTCHA | Challenge endpoint on registration only |
-| Calling (V2) | Advertised as `calling: false` in `/capabilities` |
-| Data export | Returns ZIP of ciphertext and account metadata |
-| Account deletion | Anonymises user record; cascades session, device, KeyPackage, MLS Remove |
-| WebSocket | Advertised as `wss://` in production, `ws://` in development |
+| Calling (V2) | `calling: false` in `/capabilities` |
+| Data export | ZIP of ciphertext and account metadata |
+| Account deletion | Anonymises user record; cascades session, device, KeyPackage |
+| WebSocket | `wss://` in production, `ws://` in development |
 | HTTPS | Enforced by reverse proxy; server redirects and sends HSTS |
+| Storage backend | Advertised as `storage_backend` in `/capabilities` |
 
 ---
 
@@ -1155,14 +1220,17 @@ This matrix describes **server behaviour** for features the client relies on. Cl
 | 6b | Cleanup scheduler + jobs | 6a |
 | 6c | Account deletion + data export (GDPR) | 6a |
 | 6d | HTTPS enforcement + static SPA hosting | 6a |
-| 7 | Room CRUD + membership + ownership transfer | 5 |
-| 8 | Room invites | 7 |
-| 9 | KeyPackage upload, claim, quota enforcement | 7 |
+| 7a | Room lifecycle and membership | 5 |
+| 7b | Room moderation | 7a |
+| 8 | Room invite codes | 7a |
+| 9 | KeyPackage upload, claim, quota enforcement | 7a |
 | 10 | Welcome routing + MLS epoch linearization | 9 |
-| 11 | Sockudo integration (publish, subscribe, history) | 10 |
-| 12 | Attachment upload, download, content addressing, retention pruning | 11 |
+| 11 | Sockudo integration (publish, auth, realtime sync) | 10 |
+| 12a | Attachment upload, download, delete (chunked format) | 11 |
+| 12b | Range requests + presigned URLs (streaming) | 12a |
+| 12c | Retention pruning + cleanup job | 12b |
 | 13 | Admin web UI (Coralite) | 6a |
-| 14 | User web UI (Coralite) | 11 |
+| 14 | User web UI (Coralite) | 12b |
 | 15 | Push notifications (Web Push first) | 14 |
 | 16 | APNs and FCM support | 15 |
 | 17 | Automatic backups + restore CLI | 6a |
@@ -1179,155 +1247,78 @@ This matrix describes **server behaviour** for features the client relies on. Cl
 | Server sees plaintext messages | Never |
 | Server sees decryption keys | Never |
 | Server sees message metadata | Minimal: room ID, sender client ID, epoch, coarsened timestamp |
-| Server sees profile contents | Never (profile_blob is E2E encrypted) |
-| Server sees display name | Yes (required for push notifications) |
-| Server sees username | Yes (required for lookup) |
-| Server sees attachment contents | Never (blobs are encrypted before upload) |
-| Server can MITM group joins | Only if safety numbers are not verified |
-| Server can decrypt past messages | No (forward secrecy via MLS) |
-| Server can decrypt future messages after compromise | No (post-compromise security via MLS) |
-| Web client is protected against compromised server | No. Web code is host-delivered. |
-| Native client is protected against compromised server | Yes. Signed binaries with independent update channel. |
-| Registration endpoints are bot-resistant | Yes. ALTCHA PoW v2 in deterministic mode. |
-| Registration endpoints use third-party CAPTCHA | Never. ALTCHA is fully self-hosted. |
+| Server sees profile contents | Never |
+| Server sees display name | Yes (for push) |
+| Server sees username | Yes (for lookup) |
+| Server sees attachment contents | Never |
+| Server sees attachment plaintext size | Yes (metadata for range translation) |
+| Server can decrypt past messages | No (forward secrecy) |
+| Server can decrypt future messages | No (post-compromise security) |
+| Web client protected against compromised server | No. Host-delivered code. |
+| Native client protected against compromised server | Yes. Signed binaries. |
+| Registration endpoints bot-resistant | Yes. ALTCHA. |
 | Server can force peers to delete local copies | No. Tombstones are advisory. |
-| Production traffic is HTTPS | Yes. Enforced by reverse proxy with HSTS. |
-| HTTP is permitted in production | No. `APP_URL` must use `https://`; server refuses to start otherwise. |
-| TLS terminates inside the Axum process | No. Terminates at reverse proxy. |
+| Production traffic is HTTPS | Yes. Enforced by reverse proxy. |
+| Attachments are streamed via range requests | Yes, with chunked AES-GCM. |
+| Attachments are vulnerable to truncation attacks | Mitigated by per-chunk AAD with chunk_count and is_last. |
 
 ---
 
 ## 13. Backups and Disaster Recovery
 
-- Automatic snapshots of SQLite, OPRF key, and optionally attachment blobs every `BACKUP_INTERVAL_HOURS`.
-- Snapshots are encrypted with `backup_key` derived from the root secret.
-- Retention: `BACKUP_RETENTION_COUNT` (default 30).
-- Restore is CLI-only: `server restore --from <path> --confirm`.
-- The API lists backups and triggers manual backups but cannot restore them.
-
-**Backup exclusions:** Client-side keys are never backed up. If a client's device is lost and the recovery code is lost, the data is unrecoverable. This is a documented property of E2EE, not a bug.
+- Automatic snapshots of SQLite and the OPRF key every `BACKUP_INTERVAL_HOURS`.
+- Attachment blobs are included only if `BACKUP_INCLUDE_ATTACHMENTS=true`.
+- Snapshots encrypted with `backup_key` derived from the root secret.
+- Restore is CLI-only.
+- Attachment blobs on S3 are not backed up by the server — rely on S3's own durability and versioning.
 
 ---
 
 ## 14. GDPR Compliance
 
-The controller (the person running the instance) is responsible for responding to data subject requests. The software provides the technical mechanisms. Legal obligations rest with the controller.
-
 ### 14.1 Data Subject Rights
 
-| Right | Article | Server mechanism |
+| Right | Article | Mechanism |
 |---|---|---|
-| Right of access | Art. 15 | `GET /users/me/export` |
-| Right to rectification | Art. 16 | `PATCH /users/me` (display name, profile) |
-| Right to erasure | Art. 17 | `DELETE /users/me` |
-| Right to restriction | Art. 18 | Account disable (admin endpoint) |
-| Right to data portability | Art. 20 | Machine-readable ZIP export |
-| Right to object | Art. 21 | Account deletion |
+| Access | Art. 15 | `GET /users/me/export` |
+| Rectification | Art. 16 | `PATCH /users/me` |
+| Erasure | Art. 17 | `DELETE /users/me` |
+| Restriction | Art. 18 | Account disable |
+| Portability | Art. 20 | ZIP export |
+| Object | Art. 21 | Account deletion |
 
-### 14.2 Account Deletion — `DELETE /api/v1/users/me`
+### 14.2 Account Deletion
 
-**Request body:**
+Anonymises the user row, deletes devices, sessions, KeyPackages, push subscriptions, room memberships, and queues MLS removes. The `users.id` is preserved for referential integrity.
 
-```json
-{
-  "confirm": "DELETE"
-}
-```
+### 14.3 Data Export
 
-**Preconditions:**
+ZIP archive with `profile.json`, `devices.json`, `sessions.json`, `rooms.json`, `messages.json`, `attachments.json`, `audit.json`, `README.txt`. `attachments.json` lists metadata and manifest fields but not the blob (which the client can fetch separately).
 
-- Session must have been created within the last 5 minutes.
-- `confirm` must exactly equal `"DELETE"`.
-- User must not be the last user with the `owner` role.
+### 14.4 Retention
 
-**Behavior:** Single transaction that:
-
-1. Deletes all unconsumed KeyPackages.
-2. Deletes all push subscriptions.
-3. Queues MLS Removes for every room the user is a member of.
-4. Deletes the `recovery_vault` record if it exists.
-5. Deletes all devices (cascades sessions).
-6. Deletes any remaining sessions without a device.
-7. Anonymises the user row:
-   - `username = "deleted_<random>"`
-   - `username_hash = <random>`
-   - `display_name = NULL`
-   - `profile_blob = NULL`
-   - `opaque_registration = <random 32 bytes>`
-   - `identity_pubkey = ""`
-   - `max_file_size_bytes = NULL`
-   - `disabled_at = now()`
-   - `deleted_at = now()`
-8. Removes all room memberships.
-9. Writes an audit entry with action `user.delete`.
-
-Returns HTTP 204.
-
-**Why anonymise:** `users.id` is referenced by messages, attachments, and room memberships. Hard delete cascades and destroys other users' data. Anonymisation removes personal data while preserving referential integrity.
-
-### 14.3 Data Export — `GET /api/v1/users/me/export`
-
-Returns a ZIP archive with:
-
-| File | Contents |
-|---|---|
-| `profile.json` | Username, display name, created_at, roles |
-| `devices.json` | Device list |
-| `sessions.json` | Session history |
-| `rooms.json` | Room membership |
-| `messages.json` | Server-visible message metadata (ciphertext) |
-| `audit.json` | Audit entries where the user is the actor |
-| `README.txt` | Format documentation and ciphertext limitation |
-
-**Limitation:** The export contains ciphertext, not plaintext. The server cannot decrypt.
-
-**Rate limit:** One export per `EXPORT_RATE_LIMIT_HOURS` (default 24).
-
-### 14.4 Retention Policy
-
-Instance config `DATA_RETENTION_DAYS` (default `0` = forever). When set, sessions, messages, and attachments older than the window are purged.
+`DATA_RETENTION_DAYS` controls message and attachment purge. `AUDIT_RETENTION_DAYS` controls the audit log.
 
 ### 14.5 Tombstone Semantics
 
-Deleted messages are tombstoned. The server deletes its copy from Sockudo history. Peers receive a tombstone and delete their local copy if their client honours it. The server cannot force peer deletion.
+Deleted messages are tombstoned. The server deletes its copy. Peers delete local copies at their discretion. The server cannot force peer deletion.
 
 ### 14.6 Metadata Minimisation
 
-| Field | Minimisation |
-|---|---|
-| `devices.client_id` | Random 128-bit, not a hardware identifier |
-| `sessions.last_seen_at` | Coarsened to hour |
-| `messages.created_at` | Coarsened to minute |
-| `audit_log.metadata` | Never includes content or IPs |
-| IP addresses | Not stored in schema; logs rotated |
+Timestamps coarsened where practical. No IP addresses in the database. Audit metadata excludes content.
 
 ### 14.7 Controller Obligations
 
-The controller is responsible for:
-
-- Publishing a privacy policy
-- Providing a DPA if operating commercially
-- Documenting server location and sub-processors
+Controller publishes privacy policy, provides DPA if needed, documents server location and sub-processors (Sockudo, S3).
 
 ### 14.8 Audit Actions
 
-| Action | Triggered by |
-|---|---|
-| `user.delete` | `DELETE /users/me` |
-| `user.export` | `GET /users/me/export` |
-| `config.update` | Admin config change |
-| `secret.update` | Admin secret rotation |
-| `limits.update` | Admin limits change |
-| `role.grant` / `role.revoke` | Admin role change |
-| `invite.create` / `invite.revoke` | Invite management |
-| `device.revoke` | Device revocation |
-| `bootstrap.owner` | First user registration |
-| `vapid.rotate` / `altcha.rotate` | Secret rotation |
+`user.delete`, `user.export`, `config.update`, `secret.update`, `limits.update`, `role.grant`, `role.revoke`, `invite.create`, `invite.revoke`, `device.revoke`, `bootstrap.owner`, `vapid.rotate`, `altcha.rotate`, `storage.migrate`.
 
 ---
 
 ## 15. Document Status
 
-This is the contract for the server side of the system. Every Jules task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing from this spec, it does not exist yet — it must be added here first, then built.
+This is the contract for the server side of the system. Every Jules task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing, it does not exist yet — it must be added here first, then built.
 
-The spec is frozen for V1. New features go into V2. Bug fixes and clarifications are amendments, not revisions.
+The spec is frozen for V1. New features go into V2. Bug fixes and clarifications are amendments.
