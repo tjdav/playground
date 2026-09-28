@@ -1,4 +1,3 @@
-```markdown
 # Server Specification v1.0
 
 > **Status:** Stable — source of truth for all Jules tasks.
@@ -2153,4 +2152,3 @@ Design questions — behavior, policy, trade-offs — are resolved through reaso
 This is the contract for the server side of the system. Every Jules task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing, it does not exist yet — it must be added here first, then built.
 
 Amendments are tracked in §16. The spec is stable for V1; new features go into V2.
-```
