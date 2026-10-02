@@ -70,7 +70,7 @@ Everything in V1 §2.1, plus:
 
 2.2 Presence and Co-Presence
 
-Ambient presence is refused. The server does not track or expose who is online, when they were last seen, or what they are doing across the system. There are no presence channels. sessions.last_seen_at is not user-facing and is coarsened in any admin view. The client spec’s “Last seen” setting is removed.
+Ambient presence is refused. The server does not track or expose who is online, when they were last seen, or what they are doing across the system. There are no presence channels. sessions.last_seen_at (the HTTP sessions table, §7.1) is not user-facing and is coarsened in any admin view. The client spec’s “Last seen” setting is removed.
 
 Call-scoped co-presence is permitted. Within a call or a session, the server knows in memory which room members are participating, in order to route media. This knowledge is disclosed only to participants of the same call or session. It is held in memory only and is never written to any persistent store or external system. Leaving a call or session removes the participant completely; no record remains.
 
@@ -203,7 +203,7 @@ Unchanged from V1 §4.4. GET /rooms/:id continues to return effective_max_file_s
 All jobs run on the shared hourly scheduler.
 
 Job Retention Notes
-Session cleanup 30 days after expiry or revocation V1.
+Session cleanup 30 days after expiry or revocation V1. HTTP sessions.
 Rate limit table 24 hours V1.
 Audit log AUDIT_RETENTION_DAYS (90) V1.
 Attachment pruning Three-tier effective retention V1.
@@ -216,7 +216,7 @@ Push subscription expiry 90 days of inactivity V2. Revokes and deletes push_subs
 Key transparency retention key_transparency_retention_days V2.
 Recovery code consumption Immediate V2. Consumed codes are marked, not deleted, for audit.
 Call state cleanup 24 hours after call end V2. Deletes call_sessions rows and any dangling participants.
-Session metadata pruning (optional) 90 days of zero occupancy, disabled by default V2. A session is a persistent space. Do not enable without operator intent.
+Room session metadata pruning (optional) 90 days of zero occupancy, disabled by default V2. A session is a persistent space. Do not enable without operator intent.
 
 No cleanup job is required for session occupancy. Occupancy is in-memory and self-cleaning. There is nothing to prune.
 
@@ -258,7 +258,7 @@ DB_PATH=/data/app.db
 DB_BUSY_TIMEOUT_MS=5000
 ```
 
-5.4 Sessions (HTTP Sessions)
+5.4 HTTP Sessions
 
 ```env
 SESSION_EXPIRY_DAYS=30
@@ -400,7 +400,7 @@ Compatibility note. The key file format is identical to V1’s. Existing V1 file
 
 Unchanged from V1 §5.9, with additions:
 
-· Backups include the OPRF key, the ALTCHA HMAC secret, the VAPID keys, the key transparency log directory, and all database contents.
+· Backups include the OPRF key, the ALTCHA HMAC secret, the VAPID keys, the key transparency log directory, the session types config, and all database contents.
 · Attachment blobs are included only if BACKUP_INCLUDE_ATTACHMENTS=true and STORAGE_BACKEND=fs.
 · Model files are included only if BACKUP_INCLUDE_MODELS=true. Default false — models are large and immutable, and are recoverable from a shared origin if one is configured.
 
@@ -510,7 +510,7 @@ CALL_MAX_PARTICIPANTS=8
 OPRF_BLIND_ENABLED=true
 ```
 
-5.26 Sessions
+5.26 Sessions (Real-Time)
 
 ```env
 SESSIONS_ENABLED=true
@@ -921,6 +921,7 @@ CREATE TABLE devices (
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- HTTP sessions. Distinct from `room_sessions` (§7.9). See Amendment 36.
 CREATE TABLE sessions (
     id           TEXT PRIMARY KEY,
     user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1161,12 +1162,14 @@ CREATE TABLE call_participants (
     PRIMARY KEY (call_id, user_id)
 );
 
-CREATE TABLE sessions (
+-- Renamed from `sessions` to `room_sessions` to avoid collision with the
+-- HTTP sessions table in §7.1. See Amendment 36.
+CREATE TABLE room_sessions (
     id               TEXT PRIMARY KEY,
     room_id          TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
     extension_id     TEXT NOT NULL,
     session_type     TEXT NOT NULL,
-    created_by       TEXT NOT NULL REFERENCES users(id),
+    created_by       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     metadata         TEXT,
     metadata_version INTEGER NOT NULL DEFAULT 1,
     position         INTEGER NOT NULL DEFAULT 0,
@@ -1175,8 +1178,9 @@ CREATE TABLE sessions (
     updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_sessions_room ON sessions(room_id, position);
-CREATE INDEX idx_sessions_extension ON sessions(room_id, extension_id, session_type);
+CREATE INDEX idx_room_sessions_room ON room_sessions(room_id, position);
+CREATE INDEX idx_room_sessions_extension
+    ON room_sessions(room_id, extension_id, session_type);
 ```
 
 Session occupancy is not stored. There is no session_participants table. Occupancy is held in memory only and is lost on restart.
@@ -1393,6 +1397,8 @@ POST /users/me/starred-items Star an item
 DELETE /users/me/starred-items/:item_id Unstar an item
 POST /users/me/avatar Upload avatar
 
+Note on /users/me/sessions. This path refers to HTTP sessions (§7.1). It is distinct from /rooms/:id/sessions (§8.7), which refers to real-time sessions. The URL prefixes disambiguate. Do not merge them.
+
 8.2.1 GET /users/me
 
 ```json
@@ -1537,6 +1543,10 @@ POST /rooms/:id/sessions/:session_id/leave Leave a session
 POST /rooms/:id/sessions/:session_id/heartbeat Heartbeat
 GET /rooms/:id/sessions/:session_id/roster Current participants (gated)
 POST /rooms/:id/sessions/:session_id/signal Relay signaling
+
+Note on table naming. The database table backing these endpoints is room_sessions, not sessions. The HTTP sessions table (§7.1) uses the sessions name. The API resource is sessions. The distinction is intentional. See Amendment 36.
+
+Note on /sessions API resource name. The API resource name sessions is used in two places: /users/me/sessions for HTTP sessions (§8.2) and /rooms/:id/sessions for real-time sessions (§8.7). The two are distinct resources with distinct schemas. The URL prefixes disambiguate. Do not merge them.
 
 8.7.1 POST /calls/turn-credentials
 
@@ -1900,13 +1910,15 @@ Unchanged from V1 §14.1.
 
 14.2 Account Deletion
 
-Anonymises the user row, deletes devices, sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, device names, starred items). Queues MLS removes.
+Anonymises the user row, deletes devices, HTTP sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, device names, starred items). Queues MLS removes.
 
 Identity columns on deletion:
 
 · username_token — set to a random 86-character base64url string. This satisfies the NOT NULL UNIQUE constraint and prevents reuse of the original token.
 · encrypted_display — set to NULL.
 · profile — set to NULL.
+
+Room session records (room_sessions): where created_by is the deleted user are cascaded. Sessions the user merely participated in (but did not create) are unaffected and remain. In the normal account deletion path, the user row is anonymised rather than deleted, so the cascade does not fire — this is a defensive constraint for admin force-deletes and future schema evolution.
 
 Key transparency log: entries are retained (the log is append-only) but user_id is replaced with a random placeholder. The username_token in the KT log is retained because the log is the public audit record.
 
@@ -1935,7 +1947,7 @@ Field Leak Mitigation
 users.username_token Opaque; requires OPRF key to invert Key compromise is catastrophic and documented
 users.encrypted_display Opaque ciphertext Key derived from OPRF token
 devices.encrypted_device_name Opaque ciphertext Key derived from OPRF token
-sessions.last_seen_at Timestamp Coarsened to hour in admin views
+sessions.last_seen_at Timestamp (HTTP sessions) Coarsened to hour in admin views
 messages.created_at Timestamp Coarsened to minute
 room_messages.edited_at Edit timing Coarsened to day in admin views
 room_messages.deleted_at Deletion timing Coarsened to day in admin views
@@ -2142,9 +2154,21 @@ Key constraints:
 · Client extension systems are entirely client-side. The server sees only session_type and extension_id as opaque strings.
 · Signal payloads are relayed opaquely. Server-side interpretation of signal content is forbidden. This is an architectural constraint, not a privacy measure. Extensions define their own signaling protocols.
 
+Table naming correction (Amendment 36). The real-time sessions table was renamed from sessions to room_sessions to avoid a collision with the HTTP sessions table in §7.1. All references in this amendment to “sessions” as a table refer to room_sessions.
+
 Forward-looking note: Extension-scoped fire-and-forget broadcasts to room members outside of a session (“someone is watching”) are a future addition. When drafted, the mechanism will generalize the existing client-events channel (client-typing.*), not introduce a new mechanism.
 
 Affected tasks: Phase 40 (renamed from Hangouts to Sessions; new task session-types-config).
+
+16.24 Amendment 36 — Resolve sessions Table Name Collision — 2026-10-02
+
+Change: The real-time sessions table introduced by Amendment 35 was renamed from sessions to room_sessions. The HTTP sessions table in §7.1 retains the name sessions. The API resource name sessions (used in route paths) is unchanged. room_sessions.created_by cascades on user deletion.
+
+Rationale: §7.1 and §7.9 both defined a table named sessions. SQLite rejects duplicate table names. Renaming the newer table was the smaller change and produced a more descriptive name.
+
+Sections affected: §7.9, §8.7, §14.2, §16.23.
+
+Affected tasks: Phase 40a, 40b, 40c, 40d. The implementation uses room_sessions as the table name, sessions as the API resource name, and RoomSession as the Rust struct name.
 
 ---
 
