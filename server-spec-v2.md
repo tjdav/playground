@@ -306,6 +306,7 @@ RATE_SESSION_CREATE_HOURLY=20
 RATE_SESSION_CREATE_DAILY=100
 RATE_SESSION_JOIN_PER_MIN=30
 RATE_SESSION_HEARTBEAT_PER_MIN=10
+RATE_SESSION_SIGNAL_PER_MIN=120
 RATE_MODEL_DOWNLOAD_PER_MIN=30
 ```
 
@@ -323,6 +324,7 @@ RATE_SESSION_CREATE_HOURLY 20 Per user.
 RATE_SESSION_CREATE_DAILY 100 Per user.
 RATE_SESSION_JOIN_PER_MIN 30 Per user.
 RATE_SESSION_HEARTBEAT_PER_MIN 10 Per user, per session. Normal usage is 4/min at 15s intervals.
+RATE_SESSION_SIGNAL_PER_MIN 120 Per user, per session. Limit is on the sender, not on deliveries. Broadcast amplification does not consume additional sender quota.
 RATE_MODEL_DOWNLOAD_PER_MIN 30 Per IP. Model downloads only.
 
 Rate limit keys:
@@ -344,6 +346,7 @@ TurnCredentials turn_credentials:{user_id}:min:{boundary} Per minute
 SessionCreate session_create:{user_id}:{hour\|day}:{boundary} Hourly, Daily
 SessionJoin session_join:{user_id}:min:{boundary} Per minute
 SessionHeartbeat session_heartbeat:{user_id}:{session_id}:min:{boundary} Per minute
+SessionSignal session_signal:{user_id}:{session_id}:min:{boundary} Per minute
 ModelDownload model_download:{ip}:min:{boundary} Per minute
 
 Rate limit state is stored in a SQLite table and pruned hourly.
@@ -551,12 +554,14 @@ max_per_room = 5
 
 Rules:
 
-· The server reads this file at startup and on SIGHUP.
+· The server reads this file at startup and on POST /admin/session-types/reload.
 · A session can only be created with a session_type present in this file.
 · A session’s max_participants cannot exceed the type’s max_participants.
 · A room can hold at most max_per_room sessions of a given type.
 · extension_id is informational and is echoed into capabilities. The server does not validate or enforce it.
 · Malformed or missing file: sessions are disabled at startup with a clear error, but the server continues running. Other features are unaffected.
+· Reload is atomic. On validation error, the previous config remains in effect, and the admin endpoint returns HTTP 400 with the validation error. See §8.3.
+· No SIGHUP. Reload is triggered only via the admin endpoint. This is portable across containerized deployments.
 
 Client build emission. The client build process may emit a recommended SESSION_TYPES.toml as a build artifact via atoll-chat build --emit-session-types. The emitted file is a suggestion; the server reads only the operator’s copy.
 
@@ -1185,6 +1190,10 @@ CREATE INDEX idx_room_sessions_extension
 
 Session occupancy is not stored. There is no session_participants table. Occupancy is held in memory only and is lost on restart.
 
+metadata_version increment path. metadata_version increments on every successful PATCH that changes metadata. It does not increment when only position is updated. The session.updated event carries the new metadata_version.
+
+created_by cascade policy. created_by REFERENCES users(id) ON DELETE CASCADE. If a user is force-deleted via direct SQL or a future admin operation, the sessions they created are removed. This cascade is unreachable via the normal account-deletion path, which anonymises the user row rather than deleting it.
+
 In-memory occupancy shape (not persisted):
 
 ```
@@ -1516,6 +1525,42 @@ GET /admin/rooms/:id/sessions Read-only list of sessions (metadata only, no occu
 POST /admin/models/reload Reload the model manifest
 POST /admin/session-types/reload Reload SESSION_TYPES.toml
 
+8.3.1 POST /admin/session-types/reload
+
+Auth: Required. Admin role.
+
+Request: None.
+
+Behavior:
+
+1. Read SESSION_TYPES_CONFIG_PATH.
+2. Validate. On error, leave the previous config in effect.
+3. On success, atomically swap the in-memory allowlist.
+
+Success response (HTTP 200):
+
+```json
+{
+  "reloaded": true,
+  "session_types": [
+    { "type": "voice", "extension_id": "core.hangouts", "max_participants": 12, "max_per_room": 3 },
+    { "type": "watch", "extension_id": "com.example.watch-together", "max_participants": 20, "max_per_room": 5 }
+  ]
+}
+```
+
+Error response (HTTP 400):
+
+```json
+{
+  "error": "invalid_session_types_config",
+  "message": "Validation failed",
+  "details": { "line": 4, "reason": "max_participants must be a positive integer" }
+}
+```
+
+Atomicity. The reload either succeeds and swaps the config, or fails and leaves the previous config in effect. There is no partial state.
+
 8.4 Rooms
 
 Unchanged from earlier specification, plus the previously specified endpoints for metadata, retention preview, and member pagination.
@@ -1610,7 +1655,7 @@ Permission: creator, room owner, or moderator (Discord mode). extension_id is no
 
 Request: { "metadata": "<base64>", "position": 0 } (both optional).
 
-Behavior: update row; if position supplied, re-sequence other sessions in the room; publish session.updated.
+Behavior: update row; if metadata supplied, increment metadata_version; if position supplied, re-sequence other sessions in the room; publish session.updated with the changed field indicating which fields changed.
 
 8.7.6 DELETE /rooms/:id/sessions/:session_id
 
@@ -1678,7 +1723,7 @@ Request:
 ```json
 {
   "sender_client_id": "<client_id>",
-  "target_client_id": "<client_id>",
+  "target_client_id": "<client_id, optional>",
   "signal_type": "<extension-defined>",
   "payload": "<base64, opaque>"
 }
@@ -1686,11 +1731,26 @@ Request:
 
 Behavior:
 
-1. Verify both caller and recipient (recipient_user_id derived from the roster) are current participants.
+1. Verify the caller is a current participant.
 2. Verify sender_client_id belongs to the authenticated user.
-3. Publish session.signal on private-user-{recipient_user_id}.
+3. If target_client_id is present (unicast):
+   a. Verify it is a client ID of a current participant, including the caller’s own other clients.
+   b. If not found, return 404 target_not_found. This is a semantic not-found — the named target is not in this session — distinct from a URL-level 404. No roster is returned in the response.
+   c. Publish session.signal on private-user-{target_user_id}.
+   d. Return 200 OK with { "delivered_to": 1 }.
+   e. If target_client_id belongs to the caller’s own user, the event is published on private-user-{caller_user_id}. The originating client will receive its own event and should drop it by comparing sender_client_id against its own client_id. This is a client-side concern.
+4. If target_client_id is absent (broadcast):
+   a. Publish session.signal on private-user-{user_id} for every participant whose user_id differs from the caller’s user_id.
+   b. Return 202 Accepted with { "delivered_to": <count> }.
+   c. delivered_to counts users, not clients. If user B has three clients in the session, B is one delivery.
+   d. If the session has no other users, delivered_to is 0.
+   e. The caller’s own other clients do not receive the broadcast. To sync the caller’s own devices, use unicast with target_client_id.
 
 The server does not parse, validate, log, or store signal_type or payload. Extensions define their own signaling protocols.
+
+delivered_to is returned to the caller but is not logged server-side. It could be used to reconstruct session occupancy at the moment of a signal.
+
+Rate limit: RATE_SESSION_SIGNAL_PER_MIN, keyed per user, per session. The limit is on the sender, not on deliveries. Broadcast amplification does not consume additional sender quota.
 
 Initiation pattern: the joining participant initiates offers to each existing participant. Existing participants answer. This is a client convention, not enforced by the server.
 
@@ -1733,11 +1793,13 @@ call.started { call_id, room_id, initiator_id, started_at } On call session star
 call.ended { call_id, room_id, ended_at } On call end
 call.signal { call_id, sender_user_id, signal_type, payload } After signal
 session.created { room_id, session_id, extension_id, session_type, created_by, created_at } After create
-session.updated { room_id, session_id, metadata?, position? } After PATCH
+session.updated { room_id, session_id, metadata?, metadata_version?, position?, changed: ["metadata" \| "position"] } After PATCH
 session.deleted { room_id, session_id, extension_id } After DELETE or room deletion
 session.occupancy { room_id, session_id, participant_count } On join/leave/timeout, debounced
 
 session.occupancy carries only a count. It never carries identities. Identities are exchanged through the roster endpoint and signaling path, which are gated on participation.
+
+session.updated carries a changed array indicating which fields changed. This lets the client know whether to re-render the metadata, re-sort the list, or both.
 
 User events (private-user-{user_id}, durable):
 
@@ -1799,7 +1861,7 @@ Multi-device sync User-scoped state + user_seq cursor
 User events Durable; live push + REST catch-up
 Room events Best-effort; REST reconciliation
 Calls Signaling on room channel; TURN via dedicated endpoint
-Sessions Persistent metadata; in-memory occupancy; count-only room events; roster gated on participation; dense positions; cross-device leave permitted; opaque signal relay; extension_id advisory; operator-configured type allowlist
+Sessions Persistent metadata; in-memory occupancy; count-only room events; roster gated on participation; dense positions; cross-device leave permitted; opaque signal relay with unicast and broadcast modes; extension_id advisory; operator-configured type allowlist
 Model hosting Three modes: local, external, proxy. Capabilities advertise the base URL and mode.
 Push notifications sender_ref replaces sender_user_id
 Client events client-typing.* only
@@ -1877,6 +1939,7 @@ Session signaling requires both parties to be participants Yes
 Session signal payloads are opaque Yes. Server relays bytes. No interpretation, logging, or storage. This is an architectural constraint, not a privacy measure.
 Session extension_id is authenticated No. It is advisory. Room membership is the authorization boundary.
 Session type allowlist Operator-configured via SESSION_TYPES.toml.
+delivered_to is logged server-side No. Returned to the caller but not persisted or logged.
 Model files are immutable and content-addressed Yes
 Model hosting can be shared across instances Yes, via external mode
 SPA bundle is version-coupled Yes (deployment concern, not a server feature)
@@ -1932,6 +1995,7 @@ Unchanged from V1 §14.3, plus:
 · Starred items are included.
 · Preferences are included.
 · Session participation is not in the export because it is not stored.
+· Created sessions are exported as metadata (session_id, room_id, extension_id, session_type, created_at). The metadata column is not exported. It is opaque ciphertext the controller cannot interpret. Session participation (occupancy) is not exported because it is not stored.
 
 14.4 Retention
 
@@ -1958,6 +2022,7 @@ kt_log.username_token Public by design It is the KT subject
 session.occupancy N/A Not persisted; never exported
 Session roster N/A In-memory; gated on participation
 Session signal payloads N/A Never parsed, logged, or stored
+delivered_to N/A Returned to caller; not logged
 Model files N/A Immutable; not user data
 
 14.7 Controller Obligations
@@ -1983,7 +2048,7 @@ V1 actions plus:
 · model.manifest_reload
 · session_types.reload
 
-No audit entry is written for session join, leave, heartbeat, or occupancy change. That would create exactly the log this design refuses.
+No audit entry is written for session join, leave, heartbeat, signal, or occupancy change. That would create exactly the log this design refuses.
 
 ---
 
@@ -2169,6 +2234,51 @@ Rationale: §7.1 and §7.9 both defined a table named sessions. SQLite rejects d
 Sections affected: §7.9, §8.7, §14.2, §16.23.
 
 Affected tasks: Phase 40a, 40b, 40c, 40d. The implementation uses room_sessions as the table name, sessions as the API resource name, and RoomSession as the Rust struct name.
+
+16.25 Amendment 37 — Sessions Clarifications — 2026-10-02
+
+Change: Resolves six ambiguities in the sessions feature introduced by Amendment 35. Five items accepted as proposed. Item 1 is revised.
+
+1. session.signal — target_client_id stays optional.
+
+· When present: unicast. Delivery to the target client only.
+· When absent: broadcast. Delivery to every participant whose user_id differs from the caller’s user_id.
+· delivered_to counts users, not clients. Not logged server-side.
+· §8.7.11 clarifies both modes.
+· §8.8 event catalog unchanged (the field remains optional).
+
+2. New rate limit RATE_SESSION_SIGNAL_PER_MIN.
+
+· Default 120 per user, per session.
+· Key format: session_signal:{user_id}:{session_id}:min:{boundary}.
+· Applies per sender, not per delivery. Broadcast amplification does not consume additional sender quota.
+
+3. metadata_version increment path defined.
+
+· Increments on every successful PATCH that changes metadata.
+· Does not increment on position-only updates.
+· session.updated gains a changed: ["metadata" | "position"] field indicating which fields changed.
+
+4. SIGHUP removed. Admin endpoint only.
+
+· The server reads SESSION_TYPES.toml at startup and on POST /admin/session-types/reload.
+· Reload is atomic. On validation error, the previous config remains in effect. The endpoint returns HTTP 400 with the validation error.
+· Response shape documented in §8.3.1.
+
+5. created_by cascade policy documented.
+
+· created_by REFERENCES users(id) ON DELETE CASCADE.
+· Unreachable via normal account deletion. Defensive for admin force-deletes.
+
+6. Created sessions in GDPR export.
+
+· Structural fields only: session_id, room_id, extension_id, session_type, created_at.
+· metadata is not exported. It is opaque ciphertext the controller cannot interpret.
+· Participation (occupancy) is not exported because it is not stored.
+
+Sections affected: §5.6, §5.26.1, §7.9, §8.3, §8.7.11, §8.8, §14.3.
+
+Affected tasks: 40a through 40d.
 
 ---
 
