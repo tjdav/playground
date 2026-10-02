@@ -1,8 +1,8 @@
 Client Specification v1.0
 
 Status: Final — source of truth for client implementation tasks.
-Server basis: Server Specification v2.0 (including Amendments 25–29).
-Stack: Coralite 1.0.0-rc.5 (static site generator) · Wire CoreCrypto 10.5.2 · Mediabunny · Supertonic · Moonshine / Whisper · Capacitor · Tauri
+Server basis: Server Specification v2.0 including Amendments 25–38.
+Stack: Coralite 1.0.0-rc.5 · Wire CoreCrypto 10.5.2 · Mediabunny · Supertonic · Moonshine / Whisper · Capacitor · Tauri
 Design language: Privacy-first messenger. Adopts proven social-interaction patterns; visual density follows modern Western conventions. Not a clone of any single product.
 
 Design decisions made during drafting are recorded at §24.
@@ -40,6 +40,7 @@ QR codes qr-code-styling
 
 · Two static pages: index.html (auth gate), app.html (messenger shell)
 · Three-panel desktop layout; stacked mobile layout; tablet two-panel layout
+· Extension system — rail/list/detail surfaces, panel and overlay presentation, slots, events, sessions, preferences, storage, fetch (see §26)
 · Room-based conversation model (1:1 = 2-member room; no contact list)
 · OPRF-based username lookup (exact-match only)
 · Text messaging with Markdown formatting
@@ -70,14 +71,14 @@ QR codes qr-code-styling
 · Room settings (off-canvas right drawer on desktop; modal on mobile)
 · Per-room, per-user theming (theme, wallpaper, bubble style)
 · Manual room ordering (drag-and-drop, synced across devices)
-· Per-user nicknames — local aliases for room participants; synced across devices
-· Starred items — media, messages, and links marked by the user; synced across devices
+· Per-user nicknames
+· Starred items — synced across devices
 · Biometric unlock (Face ID, Touch ID, Windows Hello)
 · Recovery code flow (server-generated, server-hashed)
 · Device linking for new devices
 · Multi-device read state sync
 · Key transparency automatic verification
-· Hangouts — persistent room-scoped voice spaces
+· Sessions — persistent, room-scoped, extension-owned real-time spaces (voice, watch-together, games, and future types)
 · Calls UI (pre-call preview, in-call screen, history, PiP)
 · Push notifications (Web Push, APNs, FCM, UnifiedPush)
 · Notification actions (reply, mark as read)
@@ -89,12 +90,13 @@ QR codes qr-code-styling
 · Deep linking (universal links, custom scheme, push)
 · Accessibility (WCAG 2.1 AA)
 · Internationalization infrastructure (English)
+· Extension asset pipeline — locales, static assets, WASM modules
 
 2.2 Server Requirements (Client V1 Dependencies)
 
-The following are provided by Server Specification v2.0 and its amendments:
+Provided by Server Specification v2.0 and amendments:
 
-· OPRF-based username lookup
+· OPRF-based username lookup (Amendments 13, 30, 31, 32, 33)
 · Encrypted display names (encrypted_display)
 · private-user-{user_id} channel with user_seq
 · GET /users/me/sync?since_seq=X
@@ -108,13 +110,13 @@ The following are provided by Server Specification v2.0 and its amendments:
 · POST /users/me/avatar
 · Call signaling events + TURN credentials
 · Member list pagination, retention preview, invite metadata preview, transfer consent
-· Separate recovery flow (POST /auth/recover/start + /finish)
+· Recovery flow (POST /auth/recover/start + /finish)
 · Schema naming cleanup
-· Hangouts (server Amendment 25)
-· Model hosting for STT and TTS (server Amendment 26)
-· starred_items table + sync (server Amendment 27)
-· Generic user preferences endpoint (server Amendment 28)
-· Hangout clarifications (server Amendment 29, C1–C5)
+· Sessions — generalized from hangouts (Amendment 35)
+· Model hosting for STT and TTS (Amendment 26)
+· starred_items table + sync (Amendment 27)
+· Generic user preferences endpoint (Amendment 28)
+· Extension proxy endpoint — POST /extensions/proxy (Amendment 38)
 
 2.3 Out of Scope
 
@@ -123,7 +125,7 @@ The following are provided by Server Specification v2.0 and its amendments:
 · Server-side key escrow
 · Plaintext export of message contents
 · Username changes
-· Federation between servers
+· Federation between servers (ActivityPub is not used)
 · Multi-tenancy
 · Multiple accounts on one device
 · Analytics or crash reporting
@@ -132,9 +134,12 @@ The following are provided by Server Specification v2.0 and its amendments:
 · Chat screenshot export
 · GIF search (external API)
 · User status / away message
-· Ambient presence — hangouts are the only co-presence feature
+· Ambient presence — sessions are the only co-presence feature
 · Office document inline rendering
 · Native keyboard sticker integration (platform limitation; watchlisted)
+· Server-side extension behavior (extensions are client-only)
+· Runtime extension installation (build-time only in v1)
+· Extension streaming through the proxy (use direct fetch)
 
 ---
 
@@ -148,6 +153,7 @@ The following are provided by Server Specification v2.0 and its amendments:
 6. Honest defaults — no fake previews, no unverifiable claims.
 7. Ask when needed — permissions and prompts appear at the moment of relevance.
 8. Accessibility as a first-class mode — read-aloud, high contrast, and reduced motion are not buried settings; they shape the design of every surface.
+9. Chrome is fixed, content is free — the shell owns headers, actions, overlay frames, and settings chrome. Extensions own only what is inside the content area (§26).
 
 ---
 
@@ -163,8 +169,6 @@ Messenger src/pages/app.html Messenger shell. In-page navigation only.
 
 Navigation from the auth gate to the messenger is a full page load (window.location.href = '/app.html'). No client-side routing between pages.
 
-Each page is a plain HTML document that uses components via their <template id> tags.
-
 4.2 In-Page Routing
 
 Within app.html, a router plugin manages view state via query parameters.
@@ -172,88 +176,98 @@ Within app.html, a router plugin manages view state via query parameters.
 URL format:
 
 ```
-/app.html?view=chat&id=r_abc123
-/app.html?view=chat&id=r_abc123&messageId=m_xyz789
-/app.html?view=media
-/app.html?view=link&id=<link_id>
-/app.html?view=document&id=<doc_id>
-/app.html?view=hangout&id=<hangout_id>
-/app.html?view=settings
-/app.html?view=profile&id=u_abc123
+/app.html?rail=<extensionId>&detail=<route>&id=<selectionId>
 ```
 
-View mapping:
+Param Optional Meaning
+rail yes Active rail extension. Derived from detail when absent.
+detail yes Active detail route. Absent for list-only views.
+id yes Selection within the detail (room, message, media item).
 
-view param Renders
-chats view-chats
-chat view-chat
-media view-media
-link view-link (detail)
-links view-links (list)
-document view-document (detail)
-documents view-documents (list)
-hangout view-hangout
-calls view-calls
-settings view-settings
-profile view-profile
-join view-join-room
+Secondary params (e.g., messageId, sentenceIndex) are documented per extension.
 
-State keys synced to the URL:
-
-Key Values
-currentAppView The view names above
-activeSelectionId Room ID, user ID, message ID (context-dependent)
-activeSelectionType room, user, message
-
-Entry point: The SPA entry component calls router.init() in its client(). The router plugin handles the popstate event, parses query parameters on load, and syncs state changes back to the URL.
-
-Deep links (from push notifications, invite links) are query-param URLs:
+Examples:
 
 ```
-https://app.example.com/app.html?view=chat&id=r_abc123&messageId=m_xyz789
+?rail=media                              media list, no detail
+?detail=media-viewer&id=a3f9             media list + viewer (rail derived)
+?detail=chat&id=r_abc123&messageId=m_xyz chat list + thread
+?rail=chat&detail=hangout&id=h_abc       chat rail, session overlay
+?rail=chat                               chat list only
+```
+
+Route ownership: Every route is owned by exactly one extension. extensions.ownerOfRoute(route) resolves it. Duplicate routes are a build error (§26.13).
+
+Back stack: The browser history is the stack. Every navigation calls history.pushState. Every dismissal calls history.back(). popstate re-runs route resolution.
+
+Deep links (from push notifications, invite links, OAuth callbacks):
+
+```
+https://app.example.com/app.html?rail=chat&detail=chat&id=r_abc123&messageId=m_xyz789
 ```
 
 4.3 Directory Structure
 
 ```
-client/
-├── coralite.config.js
-├── capacitor.config.ts
-├── src-tauri/
-├── src/
-│   ├── pages/
-│   │   ├── index.html
-│   │   └── app.html
-│   ├── components/
-│   │   ├── primitives/       # ui-*
-│   │   ├── composed/         # profiles, bubbles, rows, cards
-│   │   ├── containers/       # list/thread composers
-│   │   ├── views/            # route views
-│   │   └── shell/            # messenger-shell, hosts
-│   ├── plugins/              # factory → definePlugin
-│   ├── lib/
-│   │   ├── mls/              # CoreCrypto wrapper
-│   │   ├── crypto/           # C2SP, HKDF, Web Crypto
-│   │   ├── oprf/             # OPRF blinding
-│   │   ├── media/            # Mediabunny pipeline
-│   │   ├── transcription/    # STT model loading + inference
-│   │   ├── speech/           # TTS model loading + synthesis
-│   │   ├── hangouts/         # Hangout metadata + occupancy
-│   │   ├── api/              # Fetch wrapper
-│   │   ├── p2p/              # WebRTC data channels
-│   │   ├── db/               # SQLite repositories
-│   │   ├── blobs/            # Blob filesystem
-│   │   ├── actions/          # Orchestration functions
-│   │   ├── events/           # Socket event handlers
-│   │   ├── validation/
-│   │   └── utils/
-│   ├── styles/
-│   │   ├── tokens.css
-│   │   └── utilities.css
-│   └── assets/
-├── migrations/
-├── package.json
-└── tailwind.config.js
+atoll/                              monorepo root
+├── packages/
+│   ├── extend/                     @atoll/extend — extension SDK
+│   │   ├── src/
+│   │   │   ├── define-extension.js
+│   │   │   ├── validate.js
+│   │   │   ├── ctx.js
+│   │   │   └── index.js
+│   │   └── package.json
+│   └── app/                        the SPA
+│       ├── coralite.config.js
+│       ├── capacitor.config.ts
+│       ├── src-tauri/
+│       ├── src/
+│       │   ├── pages/
+│       │   │   ├── index.html
+│       │   │   └── app.html
+│       │   ├── components/
+│       │   │   ├── primitives/       # ui-*
+│       │   │   ├── composed/         # profiles, bubbles, rows, cards
+│       │   │   ├── containers/       # list/thread composers
+│       │   │   └── shell/            # messenger-shell, hosts
+│       │   ├── extensions/           # first-party extensions
+│       │   │   ├── chat/
+│       │   │   ├── media/
+│       │   │   ├── documents/
+│       │   │   ├── links/
+│       │   │   ├── calls/
+│       │   │   ├── settings/
+│       │   │   ├── hangouts/         # voice session type
+│       │   │   ├── profile/
+│       │   │   ├── join/
+│       │   │   └── admin/
+│       │   ├── plugins/              # factory → definePlugin
+│       │   ├── lib/
+│       │   │   ├── mls/              # CoreCrypto wrapper
+│       │   │   ├── crypto/           # C2SP, HKDF, Web Crypto, content-key
+│       │   │   ├── oprf/             # OPRF blinding
+│       │   │   ├── media/            # Mediabunny pipeline
+│       │   │   ├── transcription/    # STT model loading + inference
+│       │   │   ├── speech/           # TTS model loading + synthesis
+│       │   │   ├── sessions/         # session lifecycle + signaling
+│       │   │   ├── api/              # Fetch wrapper
+│       │   │   ├── p2p/              # WebRTC data channels
+│       │   │   ├── db/               # SQLite repositories
+│       │   │   ├── blobs/            # Blob filesystem
+│       │   │   ├── actions/          # Orchestration functions
+│       │   │   ├── events/           # Socket event handlers
+│       │   │   ├── validation/
+│       │   │   └── utils/
+│       │   ├── styles/
+│       │   │   ├── tokens.css
+│       │   │   └── utilities.css
+│       │   └── assets/
+│       ├── migrations/
+│       ├── package.json
+│       └── tailwind.config.js
+├── pnpm-workspace.yaml
+└── package.json
 ```
 
 Component file naming: Each component is a single .html file. Its tag name comes from the <template id="..."> inside the file, not the filename. Components can be nested in folders. No prefix is applied.
@@ -282,12 +296,31 @@ Config loading:
 ```js
 // coralite.config.js
 import { defineConfig } from 'coralite-scripts'
+import extensionPlugin from '@atoll/extend/plugin'
 import statePlugin from './src/plugins/state-plugin.js'
 import routerPlugin from './src/plugins/router-plugin.js'
 // ... other plugins
 
+import chat from './src/extensions/chat/index.js'
+import media from './src/extensions/media/index.js'
+import documents from './src/extensions/documents/index.js'
+import links from './src/extensions/links/index.js'
+import calls from './src/extensions/calls/index.js'
+import settings from './src/extensions/settings/index.js'
+import hangouts from './src/extensions/hangouts/index.js'
+import profile from './src/extensions/profile/index.js'
+import join from './src/extensions/join/index.js'
+import admin from './src/extensions/admin/index.js'
+
 export default defineConfig({
   plugins: [
+    // Extension system — first-party extensions
+    extensionPlugin({ extensions: [
+      chat, media, documents, links, calls, settings,
+      hangouts, profile, join, admin
+    ]}),
+
+    // Shell and infrastructure
     statePlugin({ initialState: {} }),
     routerPlugin(),
     iconPlugin({ registry: /* tree-shaken icon map */ }),
@@ -306,7 +339,6 @@ export default defineConfig({
     themePlugin({ defaultTheme: 'auto' }),
     notificationPlugin({}),
     callPlugin({}),
-    hangoutPlugin({}),
     p2pPlugin({}),
     searchPlugin({}),
     i18nPlugin({ defaultLocale: 'en' })
@@ -322,8 +354,8 @@ export default defineConfig({
 
 Two-phase resolver:
 
-· Phase 1 — (pluginContext) => .... Runs once per plugin per app load. Expensive setup. Can be async.
-· Phase 2 — (instanceContext) => ({ ... }). Runs per component instance. Cheap setup.
+· Phase 1 — (pluginContext) => ... runs once per plugin per app load. Expensive setup. Can be async.
+· Phase 2 — (instanceContext) => ({ ... }) runs per component instance. Cheap setup.
 
 Plugin name → context key. A plugin named 'router' becomes client({ router }).
 
@@ -331,32 +363,26 @@ Cross-plugin access. Plugins access each other via instanceContext.<name>.
 
 Global-singleton guard. Expensive one-time work uses pluginContext.__<name>_active__ for idempotency.
 
-Asset pipeline. Assets (WASM, sticker packs, wallpapers, sounds, models) are registered in the assets array with either { pkg, path, dest } or { src, dest } form. Coralite tracks changes and rebuilds only modified assets, keeping the manifest in sync.
+Asset pipeline. Assets are registered in the assets array with either { pkg, path, dest } or { src, dest } form. Coralite tracks changes and rebuilds only modified assets.
+
+Extension system is not a Coralite concept. @atoll/extend is an Atoll package that produces Coralite plugins. Coralite does not depend on Atoll; Atoll depends on Coralite. See §26.1.
 
 4.5 State Management
 
 Global state is managed by the state plugin. Keyed pub/sub store.
 
-Consumption:
-
 ```js
 export default defineComponent({
   client({ globalStore }) {
     const { $state } = globalStore
-
-    // Read
     const rooms = $state.rooms
-
-    // Write
     $state.selectedRoomId = 'r_abc123'
-
-    // Subscribe (auto-cleans via signal)
     $state.subscribe('rooms', (rooms) => { /* re-render */ })
   }
 })
 ```
 
-State keys:
+Shell state keys:
 
 Key Shape
 currentUser User \| null
@@ -366,16 +392,7 @@ capabilities Capabilities
 rooms Record<roomId, Room>
 roomOrder string[]
 selectedRoomId string \| null
-messages:{roomId} Message[]
-members:{roomId} Member[]
-nicknames:{roomId} Record<userId, string>
-typing:{roomId} TypingUser[]
-hangouts:{roomId} Hangout[]
-activeHangout Hangout \| null
-hangoutRoster RosterEntry[] \| null (in-memory only)
-outbox OutboxEntry[]
 unreadCounts Record<roomId, number>
-starredItems Set<itemId>
 activeCall Call \| null
 callHistory Call[]
 readAloudMode boolean
@@ -383,6 +400,8 @@ readAloudState { playing, messageId, sentenceIndex }
 settings Record<string, unknown>
 ui { activeRail, modal, toasts, offline }
 pendingScrollToMessage string \| null
+
+Extension state is separate. Each extension has its own writable state slice, provided as ctx.state. Extensions do not write to $state. They read $state (read-only) and write only their own slice. See §26.10.
 
 Source of truth: SQLite. The store is an in-memory view.
 
@@ -392,79 +411,70 @@ Relationship Mechanism
 Child → parent emit(name, detail) — DOM-scoped CustomEvent, bubbles to ancestor
 Sibling / cross-tree $state key change
 Global signal $state key observed by target
+Extension → extension publicEvents with schemas (§26.7)
+Extension → shell ctx methods (navigate, present, dismiss, toast, notify)
+Shell → extension Slots mount the extension's component; public events invoke the extension's listeners
 
-No global event bus.
-
-Example — jump to message from search:
-
-```js
-// search view sets the key
-$state.pendingScrollToMessage = 'm_xyz789'
-```
-
-```js
-// message-thread subscribes
-$state.subscribe('pendingScrollToMessage', (msgId) => {
-  if (msgId) scrollToMessage(msgId)
-})
-```
+No global event bus. Cross-extension communication is declarative and validated.
 
 4.7 Boot Sequence
 
 ```
 1. index.html renders (auth gate)
-   └─ No session → stays
-   └─ Session → window.location.href = '/app.html'
-
 2. app.html loads
 3. Coralite shell renders
 4. state-plugin initializes
 5. router-plugin initializes (parses query params)
-6. Read session token from secure storage
+6. extension-plugin registers all extensions
+   └─ Build-time validation already passed; registry is populated
+7. Read session token from secure storage
    └─ Invalid → redirect to index.html
-7. Open SQLite, run migrations
-8. Hydrate from SQLite:
+8. Open SQLite, run migrations
+9. Hydrate from SQLite:
    ├─ Rooms, members, room order
    ├─ Unread counts, drafts, preferences
    ├─ Cached display names, device names, nicknames
-   ├─ Hangouts per room
+   ├─ Session metadata per room
    ├─ Starred items
    ├─ Cached read-aloud settings
-   ├─ Last-viewed room's recent messages
+   ├─ Extension storage (namespaced)
+   ├─ Extension preferences (mirrored locally)
    └─ Sync cursors (per-room + user-scoped)
-9. User-scoped state sync:
-   GET /users/me/sync?since_seq=<last_user_seq>
-   Apply read_state, user_preferences, device_state, starred_items
-   Store new max_seq
-10. CoreCrypto initialization
-11. OPRF token derivation (requires username from secure storage)
-12. Render UI with hydrated data
-13. Fetch capabilities (GET /api/v1/capabilities)
-14. Connect WebSocket (pusher-js)
-15. Subscribe to private-user-{user_id} and all private-room-{room_id}
-16. Delta sync per room (since cursor)
-17. Background: key package replenishment, welcome polling,
+10. User-scoped state sync:
+    GET /users/me/sync?since_seq=<last_user_seq>
+    Apply read_state, user_preferences, device_state, starred_items
+    Store new max_seq
+11. CoreCrypto initialization
+12. OPRF token derivation
+13. Render UI with hydrated data
+14. Fetch capabilities (GET /api/v1/capabilities)
+    └─ Read extension_proxy_enabled, sessions_enabled, session_types[]
+15. Connect WebSocket (pusher-js)
+16. Subscribe to private-user-{user_id} and all private-room-{room_id}
+17. Delta sync per room (since cursor)
+18. Background: key package replenishment, welcome polling,
     pending removes, thumbnail generation, TTS/STT model idle prefetch
 ```
 
 Failure modes:
 
 Step Failure Behavior
-6 Corrupt token Clear storage, redirect
-7–8 SQLite unavailable Degradation notice; memory-only mode
-9 Sync fetch fails Retry; app works from local state
-10 Keystore corrupted Wipe, re-init; rooms marked mls_status='error'
-11 OPRF fails Retry; app works without display-name decryption until it succeeds
-14 Socket fails Retry with backoff; app remains usable from cache
+6 Extension registration fails Build would have caught it; if runtime, render error, other extensions unaffected
+7 Corrupt token Clear storage, redirect
+8–9 SQLite unavailable Degradation notice; memory-only mode
+10 Sync fetch fails Retry; app works from local state
+11 Keystore corrupted Wipe, re-init; rooms marked mls_status='error'
+12 OPRF fails Retry; app works without display-name decryption
+15 Socket fails Retry with backoff; app remains usable from cache
 
 4.8 Sync & Offline
 
 Two cursors:
 
 · Per-room (epoch, seq) for message sync. Room events are best-effort WebSocket; REST delta sync is authoritative.
-· Per-user last_user_seq for user-scoped state. User events are durable via user_seq; catch-up via GET /users/me/sync.
+· Per-user last_user_seq for user-scoped state. User events are durable; catch-up via GET /users/me/sync.
 
-Readable offline: All cached messages, media, metadata, nicknames, starred items.
+Readable offline: All cached messages, media, metadata, nicknames, starred items, extension storage.
 
 Outbox queue: Messages composed while offline persist in SQLite. On reconnect, processed FIFO. On failure after retries, marked failed with Retry/Delete actions.
 
@@ -473,8 +483,6 @@ Read state while offline: Advances locally; debounced flush to POST /users/me/re
 No global offline banner. Feedback is inline on messages and via one-shot toasts.
 
 4.9 Component Authoring Rules
-
-Coralite components follow strict rules:
 
 Rule Implication
 Flat template tokens only No expressions, function calls, dot notation, or conditionals in <template>. All logic moves to getters.
@@ -498,7 +506,8 @@ Profile ui-profile
 Chat view-chat
 Room room-*
 Thread message-thread
-Hangout hangout-*
+Session session-*
+Extension (third-party) x-<slug>-<component>
 
 5.2 CSS Strategy
 
@@ -507,34 +516,43 @@ Design tokens CSS custom properties Global
 Global utilities Tailwind Entire app
 Component styles Coralite scoped <style> Per-component
 
-Tailwind provides layout utilities; components own structure and variant styling. Coralite scopes styles via compiler-injected data-style-selector attributes, allowing Tailwind utilities inside components.
-
 5.3 Theming
 
 Global theme: light / dark / auto. Token swap under [data-theme="dark"].
 
-Accent color: TBD. Placeholder blue (#3B82F6) used until brand decision. All components reference var(--accent-*).
+Accent palette — locked (2026-10-02):
 
-Per-room, per-user theming: Room container overrides a small subset of tokens. Stored in room_preferences (local), synced via user preferences.
+Token Light mode Dark mode
+--accent-500 #2FB6AA Lagoon Blue #4DD0C4 (brightened)
+--accent-700 #297370 Dark Aquamarine #297370 (surface fill)
+--accent-warm-500 #EC7562 Coral Reef #EC7562 (holds)
+--neutral-warm-50 #F9F1E4 Papaya Whip —
+--neutral-warm-200 #E0C0A9 Beige Skin —
 
-Variant pattern:
+Elevation tokens (both modes):
 
-```html
-<ui-profile size="md" shape="circle" state="online"></ui-profile>
-<ui-button variant="primary" size="md" disabled></ui-button>
-```
+Token Role
+--surface-0 App background, thread background
+--surface-1 Incoming bubble, rail, list rows
+--surface-2 Composer, overlay frame, cards
+--surface-3 Popovers, tooltips, hover states
+
+Semantic mapping: Components reference semantic tokens (--bubble-incoming, --text-primary), never ramp tokens directly. Semantic tokens remap under [data-theme="dark"].
+
+Contrast rules:
+
+· Teal fill on light backgrounds uses dark text (--neutral-900), not white.
+· Accent-color text on light backgrounds uses --accent-700 or darker.
+· Destructive actions use a distinct red family, not coral.
+· Coral is reserved for reactions, mentions, and warm emphasis.
+
+Per-room, per-user theming: Room container overrides a subset of tokens. Stored in room_preferences (local), synced via user preferences.
 
 5.4 Icons
 
-Solar icon set, tree-shaken via @solar-icons/static. No sprite.
+Solar icon set, tree-shaken via @solar-icons/static. No sprite. The icon-plugin resolves a canonical name and state to a concrete icon.
 
-The icon-plugin resolves a canonical name and a state to a concrete icon:
-
-```html
-<ui-icon name="chat" state="active"></ui-icon>
-```
-
-The plugin maps states to Solar styles (linear → default, bold → active, bold-duotone → emphasis). The mapping is overridable per-instance with a style attribute. Canonical names are library-agnostic.
+Extensions may only use canonical names from the Solar set. Extension authors cannot ship their own SVGs. The vocabulary command lists every available icon name.
 
 No emoji are used as icons.
 
@@ -555,9 +573,9 @@ Motion uses tokens from the design system. All motion respects prefers-reduced-m
 └──────┴──────────────┴──────────────────────────────┘
 ```
 
-Explorer pattern. Selecting an item in Panel 2 highlights it and renders detail in Panel 3.
+The rail is registry-driven. It renders every extension with a rail declaration, sorted by rail.order. There is no hard-coded rail list. See §26.5.
 
-Rail items: Chat, Media, Documents, Links, Calls, Settings.
+Explorer pattern. Selecting an item in Panel 2 highlights it and renders detail in Panel 3. Overlays cover both panels without changing the rail.
 
 6.2 Tablet (768–1023px)
 
@@ -565,7 +583,7 @@ Rail collapses to bottom nav. Panels 2 and 3 remain side by side.
 
 6.3 Mobile (< 768px)
 
-Single column. Bottom nav: Chat, Media, Calls, Profile.
+Single column. Bottom nav capped at 5 slots. Core extensions claim the fixed slots by default. Third-party extensions default to mobile.panel1.placement: 'more' and open in a More sheet.
 
 Media tab hosts a segmented control: Media / Docs / Links.
 
@@ -581,6 +599,8 @@ Scroll edge cue. A data-scrolled attribute adds a border when content is behind 
 
 Fallback. @supports not (backdrop-filter: blur(20px)) and a low-end device check disable the glass effect.
 
+Dark mode caveat: Saturation boost may amplify teal in content behind glass. Saturation values may differ per theme.
+
 6.5 Safe Areas
 
 Edge-to-edge rendering. Safe area insets provided by:
@@ -589,64 +609,65 @@ Edge-to-edge rendering. Safe area insets provided by:
 · Tauri: tauri-plugin-safe-area-insets-css
 · Web: env(safe-area-inset-*)
 
-Both plugins expose consistent CSS variables. Root viewport height uses 100dvh.
+Root viewport height uses 100dvh.
 
 6.6 Navigation Patterns
 
 Affordance Purpose
-Back arrow (←) Nested navigation (mobile)
-Close (✕) Modal dismissal
+Back arrow (←) Nested navigation (mobile). Pops the history stack.
+Close (✕) Modal dismissal. Pops the history stack.
 OK / Cancel Forced decisions
 
 Platform split:
 
-· Desktop: Explorer pattern. Media, link, and document detail render in Panel 3. Room settings open as an off-canvas drawer.
-· Mobile: Full-screen stack. Back arrows for drill-downs. Room settings uses X (modal, not nested destination).
+· Desktop: Explorer pattern. Detail renders in Panel 3. Overlays appear as centered sheets (settings) or off-canvas right drawers (room settings) with no scrim.
+· Mobile: Full-screen stack. Overlays are full-screen sheets or full-screen modals. Dismissal routes through history.back().
 
 Action placement:
 
 Position Reserved for
 Top-left Navigation (back arrow or X)
 Top-center Title
-Top-right Contextual actions (overflow menu, primary action)
+Top-right Contextual actions (declared in the surface's actions array)
 
 List-detail navigation. Detail views opened from a list support horizontal navigation through the list:
 
-· Mobile: horizontal swipe with scroll-snap. No visible arrows. A position indicator (12 of 47) appears in the header.
-· Desktop: arrows appear on hover at the left and right edges. Keyboard ←/→ navigates. Trackpad swipe works via the same scroll-snap container.
-· Gesture direction locking (8–10px threshold) prevents conflict with vertical scrolling inside the item.
-· Boundary behavior: bounce (mobile) / faded arrow (desktop).
-
-Applies to: media viewer, link detail, document detail, hangout list.
+· Mobile: horizontal swipe with scroll-snap.
+· Desktop: hover arrows, keyboard ←/→.
+· Gesture direction locking (8–10px threshold).
 
 6.7 Header Consolidation
 
 The video icon is not present in the room header. Video is selected from the pre-call preview screen.
 
-Platform Header layout
+Platform header layout:
+
+Platform Layout
 Mobile [←] [name] [phone] [headphones] [gear]
 Desktop [name] [headphones] [search] [phone] [⋯]
 
-Hangout icon: headphones glyph (Solar headphones). Not a megaphone.
+Session icon: headphones glyph (Solar headphones). Not a megaphone.
 
 State Treatment
-No hangouts No badge
-Hangouts exist, none active Subtle dot
-Hangouts active Count badge (total participants)
+No sessions No badge
+Sessions exist, none active Subtle dot
+Sessions active Count badge (total participants)
 
 Room settings on desktop: moves into [⋯] overflow. On mobile: stays as gear icon.
+
+Headers are host-drawn. Extensions declare the title and actions; the shell renders the header. See §26.5.
 
 ---
 
 7. Component Inventory
 
-Component tags correspond to <template id="..."> values inside .html files. No array or object attributes are used — collections come via plugin context or slots.
+Component tags correspond to <template id="..."> values inside .html files. Components are ambient — registered globally, referenced by tag name, no imports required.
 
 7.1 Primitives
 
 Component Responsibility Key attributes
 ui-profile User/group profile size, shape, src, state, fallback
-ui-profile-group Composite of 2–4 profiles max, size
+ui-profile-group Composite of 2–4 profiles max size
 ui-badge Unread count or dot count, variant
 ui-button Pill button variant, size, disabled, loading
 ui-input Text field type, label, error, disabled
@@ -676,7 +697,7 @@ message-attachment Attachment preview
 message-reaction Reaction chip
 message-meta Time + status
 message-waveform Voice player
-message-audio-player Audio player with transcribe + read-aloud affordances
+message-audio-player Audio player with transcribe + read-aloud
 message-transcript Transcript display
 message-tombstone Deleted placeholder
 typing-dots Typing indicator
@@ -694,10 +715,10 @@ section-header Group label
 empty-state Empty state
 safety-number Safety number
 call-participant Call participant tile
-hangout-card Hangout entry in a list
-hangout-strip Active hangout bar above thread
-hangout-bar In-hangout control bar
-hangout-participant Participant in roster
+session-card Session entry in a list
+session-strip Active session bar above thread
+session-bar In-session control bar
+session-participant Participant in roster
 
 7.3 Containers
 
@@ -705,7 +726,7 @@ Component Responsibility
 conversation-list Virtualized list (reads $state.rooms)
 message-thread Virtualized message list
 message-composer Composer with read-aloud toggle
-media-grid 3-column grid, photos + videos combined, date-grouped
+media-grid 3-column grid, photos + videos, date-grouped
 document-list Virtualized list group
 link-list Virtualized list group
 settings-list Settings rows
@@ -713,10 +734,10 @@ auth-form Auth gate form
 media-viewer Full-screen slideshow with list-detail navigation
 link-detail Link detail view
 document-detail Document detail view
-hangout-list Hangouts in a room
-hangout-roster Participants in a hangout
-hangout-create Create/edit hangout sheet
-hangout-signal-handler WebRTC signaling client
+session-list Sessions in a room
+session-roster Participants in a session
+session-create Create/edit session sheet
+session-signal-handler WebRTC signaling client
 call-participant-grid Call layout
 message-reply-preview Reply bar
 sticker-picker Sticker sheet
@@ -726,28 +747,30 @@ read-aloud-controls Playback controls for TTS
 
 Component Responsibility
 messenger-shell Root layout
-modal-host Overlay renderer
+rail-host Registry-driven rail
+surface-host Mounts list and detail surfaces per extension
+overlay-host Overlay stack renderer
+modal-host Modal renderer
 toast-host Toast queue
-call-overlay-host Call overlays
 notification-banner-host In-app banners
+call-overlay-host Call overlays
+error-boundary Per-surface error fallback
 
 7.5 Views
 
-View Contains
-view-chats conversation-list
-view-chat message-thread + message-composer
-view-media Filter bar + media-grid
-view-documents Filter bar + document-list
-view-links Filter bar + link-list
-view-link link-detail
-view-document document-detail
-view-hangout hangout-roster + controls
-view-calls call-history-list
-view-settings Section list + sub-views
-view-profile Profile detail
-view-room-settings Drawer (desktop) / modal (mobile)
-view-join-room Invite confirmation
-view-admin Administration
+Views are extension-owned. Each view's routes, titles, and actions are declared in its extension object (§26.3). The mapping:
+
+Extension Routes
+core.chat chats (list), chat (detail), room-settings (overlay)
+core.media media (list), media-viewer (detail)
+core.documents documents (list), document (detail)
+core.links links (list), link (detail)
+core.calls calls (list), call (detail)
+core.settings settings (list), settings-section (detail)
+core.sessions sessions (list), session (detail)
+core.profile profile (detail, no rail)
+core.join join (detail, no rail)
+core.admin admin (list, no rail, gated on capabilities.admin)
 
 ---
 
@@ -762,8 +785,6 @@ OPRF token Username lookup, display-name encryption, device-name encryption, RMK
 
 8.2 Room Metadata Key (RMK)
 
-A static, room-scoped symmetric key.
-
 Property Value
 Length 32 bytes (AES-256)
 Generation Random, at room creation, by the creator's client
@@ -771,26 +792,17 @@ Distribution Delivered via the MLS Welcome GroupInfo extension
 Rotation None — static for the room's lifetime
 Domain separation HKDF sub-keys per purpose
 
-Sub-key derivation:
-
 ```
 room_metadata_key    = HKDF(RMK, "room-metadata-v1",    32)
-hangout_metadata_key = HKDF(RMK, "hangout-metadata-v1", 32)
+session_metadata_key = HKDF(RMK, "session-metadata-v1", 32)
 ```
-
-Domain separation ensures that a compromise of one derived key doesn't affect the other.
 
 8.3 OPRF-Based Lookup
 
 Purpose: The server must not hold plaintext usernames or display names.
 
-Construction:
-
 ```
-Given:
-  username       The plaintext username
-  k              The server's OPRF key (derived from root_secret)
-  H              Ristretto255 hash-to-curve
+Given: username, server key k, hash-to-curve H
 
 Client:
   1. h         = H(username)
@@ -800,28 +812,34 @@ Client:
 
 Server:
   5. blinded_oprf = blinded ^ k
-  6. returns { blinded_oprf } to client
+  6. returns { blinded_oprf }
 
 Client:
-  7. token = blinded_oprf / r^k = h^k
+  7. token = OprfClient::finalize(username, blinded_oprf)
 ```
 
-Token usage:
+Token format (Amendment 31): 64-byte SHA-512 output of voprf::OprfClient::finalize(), encoded as an 86-character unpadded base64url string. Not the 32-byte group element h^k.
+
+Key derivation (Amendment 33):
 
 ```
 display_name_key = HKDF(token, "display-name-encryption-v1", 32)
 device_name_key  = HKDF(token, "device-name-encryption-v1",  32)
 ```
 
-Domain separation ensures a compromise of one derived key doesn't compromise the other.
+Bounds (Amendment 33):
 
-Client caches the token in memory for the session. Never stored at rest. Re-derived on login (requires username from secure storage; biometric login retrieves it automatically).
+· username_token: exactly 86 chars, base64url, decodes to 64 bytes.
+· encrypted_display: decodes to 28–284 bytes.
+· display_name_key ciphertext = 12-byte nonce || AES-256-GCM ciphertext.
+
+Client caches the token in memory for the session. Never stored at rest. Re-derived on login.
 
 Token stability: k is immutable for the account lifetime. The token is stable across devices and sessions.
 
 8.4 C2SP Attachment Encryption
 
-Per Server Spec §6.5. Summary:
+Summary:
 
 ```
 1. input_key = random 32 bytes
@@ -837,16 +855,16 @@ Per Server Spec §6.5. Summary:
 9. Ciphertext = header || encrypted_chunks
 ```
 
-Purpose values (client-owned; server does not see them):
+Purpose values:
 
 Purpose Use
 "message" Regular message attachments
 "room-avatar" Room avatars
 "user-avatar" User profile images
-"hangout-icon" Hangout icons
+"session-icon" Session icons
 "sticker" Custom stickers
 
-Padding: Plaintext is padded to the nearest bucket from ATTACHMENT_BUCKET_SIZES before encryption. The padded plaintext is chunked as a single C2SP message producing one short final chunk.
+Padding: Plaintext padded to the nearest ATTACHMENT_BUCKET_SIZES bucket before encryption.
 
 Range translation:
 
@@ -863,44 +881,28 @@ CoreCrypto initialization:
 
 ```
 1. Load device_secret from platform secure storage
-   (generate 32 random bytes on first launch if absent)
 2. entropy_seed = HKDF-Expand(device_secret, info="mls-entropy-v1", length=32)
-3. Open the encrypted keystore (managed by CoreCrypto)
+3. Open the encrypted keystore
 4. CoreCrypto.init(client_id, keystore, entropy_seed)
 5. CoreCrypto.mlsInit()
 ```
 
-Key package lifecycle:
-
-· Target: 20 unconsumed key packages per device.
-· Low watermark: 5.
-· Replenish on login and on app launch.
-· Rotate every 30 days.
+Key package lifecycle: Target 20 unconsumed per device. Low watermark 5. Replenish on login and on app launch. Rotate every 30 days.
 
 Group lifecycle:
 
-· Create: mlsCreateConversation(room_id), then batch-add members in a single commit.
-· Join: Poll for welcome (GET /welcomes), process via mlsProcessWelcomeMessage, consume, fetch messages from welcome epoch.
-· Leave: Server queues pending_mls_remove; another online member generates the Remove commit; the leaving client deletes local group state.
+· Create: mlsCreateConversation(room_id), batch-add members in a single commit.
+· Join: Poll for welcome (GET /welcomes), mlsProcessWelcomeMessage, consume, fetch messages from welcome epoch.
+· Leave: Server queues pending_mls_remove; another online member generates the Remove commit; leaving client deletes local state.
 
-Message encryption/decryption:
-
-· Encryption wraps the JSON payload in an MLS message, POSTs to /rooms/:id/messages.
-· Decryption uses the message's epoch. Older epochs use previous-epoch keys. Newer epochs queue and sync.
-
-Epoch transitions:
-
-· The composer enters a "Securing…" state during transitions. Outgoing messages are queued and flushed once the new epoch settles.
-· Concurrent commits handled by CoreCrypto's deterministic tie-break.
+Epoch transitions: Composer enters "Securing…" state. Outgoing messages queued and flushed once the new epoch settles. Concurrent commits handled by CoreCrypto's deterministic tie-break.
 
 8.6 Key Transparency
 
-The client consumes key transparency proofs from the server:
-
-1. Fetch identity keys with tree_head, auditor_signatures, and inclusion_proof.
+1. Fetch identity keys with tree_head, auditor_signatures, inclusion_proof.
 2. Verify the server signature, each auditor signature, and the inclusion proof locally.
 3. Mark the contact as transparency-verified on success.
-4. Display a green checkmark; no user action required in the common case.
+4. Display a green checkmark.
 
 Failure cases:
 
@@ -910,11 +912,9 @@ Auditor signatures missing "Verified by server only"
 Auditor signatures invalid Warning; unverified
 Network unavailable "Verification pending"
 
-Manual safety numbers remain available under an "Advanced" section for users who want out-of-band verification.
-
 8.7 Safety Numbers
 
-Safety numbers are computed locally from MLS identity keys. Displayed in the profile view and room profile. Verification is soft; SAFETY_NUMBER_MODE is surfaced.
+Safety numbers computed locally from MLS identity keys. Displayed in the profile view and room profile. Verification is soft; SAFETY_NUMBER_MODE is surfaced.
 
 ---
 
@@ -936,46 +936,37 @@ Small AVIF q60, max 1280px VP9, 480p, ~1 Mbps Opus 48 kbps
 
 9.2 Transcoding
 
-Mediabunny handles demux, decode, encode, resize, rotate, crop, and thumbnail extraction. GPU path uses WebCodecs. CPU fallback is ffmpeg.wasm, loaded lazily.
+Mediabunny handles demux, decode, encode, resize, rotate, crop, thumbnail extraction. GPU path uses WebCodecs. CPU fallback is ffmpeg.wasm, loaded lazily.
 
-Worker pool: Concurrency cap of 2 (1 on low-end devices). Jobs above 500 MB are processed alone. Each job exposes an AbortController.
+Worker pool: Concurrency cap of 2 (1 on low-end devices). Jobs above 500 MB processed alone. Each job exposes an AbortController.
 
-Failed transcode: Fall back to passthrough — the file is uploaded unprocessed as a generic attachment.
+Failed transcode: Fall back to passthrough — file uploaded unprocessed as a generic attachment.
 
 9.3 Thumbnail and Poster Generation
 
-During processing, the client generates a 128×128 WebP thumbnail alongside the full attachment. The thumbnail is encrypted separately (same key/salt/context) and uploaded as a companion blob. The manifest carries thumbnail_file_id.
+128×128 WebP thumbnail generated alongside the full attachment. Encrypted separately (same key/salt/context), uploaded as companion blob. Manifest carries thumbnail_file_id.
 
-For video, the client also extracts a poster frame for the thumbnail strip and preview.
+For video, poster frame extracted for thumbnail strip and preview.
 
 9.4 Padding
 
-Padding operates on the plaintext before encryption. The client:
-
-1. Selects the smallest bucket T that can contain the plaintext.
-2. Computes L_padded from T:
-   ```
-   M = T - 72
-   q = floor(M / 16400)
-   r = M - 16400 * q
-   if r < 16384: L_padded = 16384 * q + r
-   else: skip to next bucket (unreachable)
-   ```
-3. Appends zero bytes to reach L_padded.
-4. Chunks the padded plaintext.
-5. Encrypts each chunk.
+1. Select smallest bucket T containing plaintext.
+2. Compute L_padded from T.
+3. Append zero bytes to reach L_padded.
+4. Chunk padded plaintext.
+5. Encrypt each chunk.
 
 9.5 Metadata Stripping
 
-All processed media is stripped of metadata (EXIF, GPS, device info, XMP, IPTC, ICC, ID3). Documents are not modified.
+All processed media stripped of EXIF, GPS, device info, XMP, IPTC, ICC, ID3. Documents are not modified.
 
 9.6 Fast-Start MP4
 
-For MP4 files, the client validates that the moov atom is at the start. Files where moov follows mdat are re-muxed with mp4box.js. If re-muxing fails, the file is transcoded to WebM/VP9.
+For MP4 files, validate moov atom is at start. Files where moov follows mdat are re-muxed with mp4box.js. If re-muxing fails, transcode to WebM/VP9.
 
 9.7 Progress and Cancel
 
-Per-file progress is reported inline in the message thread:
+Per-file progress reported inline in the message thread:
 
 State UI
 queued Clock icon
@@ -1016,19 +1007,19 @@ Long uploads surface a Live Activity on iOS and an ongoing notification on Andro
 · Files > 1 MB: Lazy chunk fetch.
 · Media (audio/video): Always lazy.
 
-Presigned URLs are used when capabilities.storage_presign_supported is true. URLs are not cached; on expiry, a fresh URL is requested and the download resumes.
+Presigned URLs used when capabilities.storage_presign_supported is true. URLs not cached; on expiry, fresh URL requested and download resumes.
 
 10.3 P2P Fallback
 
 When a file exceeds effective_max_file_size_bytes for the room:
 
-1. A member picker modal appears.
-2. WebRTC data channels are established (one per recipient).
-3. The file transfers directly, encrypted with an ephemeral key per recipient.
-4. Chunk-level acknowledgment enables resume on connection drop.
+1. Member picker modal appears.
+2. WebRTC data channels established (one per recipient).
+3. File transfers directly, encrypted with an ephemeral key per recipient.
+4. Chunk-level acknowledgment enables resume.
 5. Cancel discards partial data on both sides.
 
-Online-only. If the recipient is offline, the send fails with a clear message.
+Online-only.
 
 10.4 Deletion
 
@@ -1037,11 +1028,9 @@ Delete for me Local only Anyone
 Unsend All members Sender, within 24h
 Remove from room All members Owner (or moderator in Discord mode)
 
-Blob deletion: Triggered by unsend/remove. Server prunes when no other references exist.
+Blob deletion triggered by unsend/remove. Server prunes when no references remain.
 
 10.5 Attachment Icon Mapping
-
-File extensions map to seven canonical categories, each with a color. The canonical name resolves to a Solar icon via the icon plugin.
 
 Category Color Extensions
 document Red pdf, doc, docx, odt, rtf, pages
@@ -1064,33 +1053,33 @@ Resolution order: MIME type → extension → generic.
 Aspect Own messages Others' messages
 Alignment Right Left
 Avatar Omitted ui-profile on left, bottom-aligned
-Sender name N/A Above the bubble on first message of a group (group chats only)
+Sender name N/A Above the bubble on first message of a group
 Bubble color var(--bubble-outgoing) var(--bubble-incoming)
 Timestamp Inside bubble, bottom-right Inside bubble, bottom-left
 Read receipt "Read" / "Read N" next to timestamp —
 
-Bubble max width: min(75%, 600px) on desktop. Corner radius: 18px default; 4px on the tail corner and inner group corners.
+Bubble max width: min(75%, 600px) on desktop. Corner radius: 18px default; 4px on tail corner and inner group corners.
 
 11.2 Sending States
 
 State Icon
 Queued Clock
-Sending Diagonal upward-left arrow (↖)
+Sending Diagonal upward-left arrow
 Sent No icon (timestamp only)
 Read "Read" / "Read N"
-Failed Circular arrow (↻); tap to retry
+Failed Circular arrow; tap to retry
 
 11.3 Message Grouping
 
-Consecutive messages from the same sender within 5 minutes are grouped: avatar and sender name appear only on the first message; timestamp on the last; inner corners tighten.
+Consecutive messages from the same sender within 5 minutes grouped: avatar and sender name on first message; timestamp on last; inner corners tighten.
 
 11.4 Date Separators
 
-Centered pill-style separators on calendar day change: "Today", "Yesterday", "March 5, 2026". A sticky date header floats at the top of the viewport.
+Centered pill-style separators on calendar day change: "Today", "Yesterday", "March 5, 2026". Sticky date header floats at the top of the viewport.
 
 11.5 New Messages Divider
 
-A horizontal line at the last-read position. Shown when opening a room with unread messages; hidden once scrolled past.
+Horizontal line at the last-read position. Shown when opening a room with unread messages; hidden once scrolled past.
 
 11.6 Scroll Behavior
 
@@ -1100,49 +1089,36 @@ A horizontal line at the last-read position. Shown when opening a room with unre
 · Own send: Always scroll to bottom.
 · Scroll-to-bottom button: Floating, appears when scrolled up; shows unseen count.
 · Infinite scroll: Trigger at ~200px from top.
-· Prepend anchoring: Viewport stays fixed on the message being read (TanStack Virtual anchorTo: 'end').
-· Stable keys: Message IDs (not indices).
+· Prepend anchoring: anchorTo: 'end'.
+· Stable keys: Message IDs.
 
 11.7 Message Context Menu
 
 Long-press (mobile) or right-click / hover bar (desktop) opens the message context menu.
 
-Universal actions:
+Universal actions: Copy, Reply, React, Select, Delete for me, Read aloud.
 
-· Copy
-· Reply
-· React
-· Select (enters multi-select mode)
-· Delete for me
-· Read aloud
+Sender-only: Unsend (within 24h).
 
-Sender-only:
+Conditional: Edit (own messages, within 15-minute window), Show original (if edited), Delete (Discord mode).
 
-· Unsend (within 24h)
+Hover bar (desktop only): compact strip with react, reply, edit, overflow.
 
-Conditional:
-
-· Edit (own messages, within 15-minute window)
-· Show original (if edited)
-· Delete (Discord mode: owner/moderator)
-
-Hover bar (desktop only): A compact strip appears on the inner side of the bubble with four buttons: react, reply, edit, overflow. Right-click opens the full menu directly.
-
-Browser context menu suppression: preventDefault() is scoped to .chat-bubble elements only.
+Browser context menu suppression scoped to .chat-bubble elements only.
 
 11.8 Message Editing
 
-Affordance: Long-press → "Edit" (mobile); hover bar → edit icon, or right-click → "Edit" (desktop).
+Affordance: Long-press → "Edit" (mobile); hover bar → edit icon (desktop).
 
-Edit mode: The composer morphs — a banner shows "Editing" with a dismiss button, the input is pre-filled, and the send button becomes a checkmark.
+Edit mode: Composer morphs — banner shows "Editing," input pre-filled, send button becomes checkmark.
 
-Window: 15 minutes from the original send time. Enforced client-side and server-side.
+Window: 15 minutes from original send time.
 
 Edits: Unlimited within the window. Each edit is a new signed message with reply_to set and sequence incrementing.
 
-Indicator: "Edited" label next to the timestamp inside the bubble.
+Indicator: "Edited" label next to timestamp inside the bubble.
 
-History: "Show original" opens a sheet showing the full edit chain with timestamps. New joiners see only versions they can decrypt; missing versions show "not available."
+History: "Show original" opens a sheet showing the full edit chain.
 
 Media messages: Text/caption only. Attachments cannot be changed.
 
@@ -1158,138 +1134,43 @@ Tap send Send
 Tap trash Discard
 Tap play Preview before sending
 
-Composer button: Dynamic — mic when empty, send when text present.
+In-thread display: message-audio-player with wavesurfer.js.
 
-In-thread display: message-audio-player with wavesurfer.js:
+Transcribed state adds the transcript below the waveform, with a mode label ("Fast · Transcribed").
 
-```
-┌───────────────────────────────────────────┐
-│  [▶] [🎙️▾]  ▁▂▃▅▆▅▃▂▁▂▃▅▆▅▃▂▁▂▃  0:15   │
-└───────────────────────────────────────────┘
-```
+Transcription mode picker:
 
-Element Behavior
-Play button Large, prominent, primary action
-Transcribe button Icon with a dropdown chevron (▾). Tapping the icon transcribes; tapping the chevron opens the picker
-Waveform Interactive — tap to seek, drag to scrub
-Duration Total duration idle; elapsed/total playing
-
-Transcribed state:
-
-```
-┌───────────────────────────────────────────┐
-│  [▶] [🎙️▾]  ▁▂▃▅▆▅▃▂▁▂▃▅▆▅▃▂▁▂▃  0:15   │
-│                                            │
-│  "Hey, just checking in about the..."     │
-│                                            │
-│  Fast · Transcribed                       │
-└───────────────────────────────────────────┘
-```
-
-Transcription mode picker (bottom sheet mobile, popover desktop):
-
-User-facing label Technical model Description
+Label Model Description
 Fast Moonshine Tiny Best for English. Quickest.
 Accurate Moonshine Small Best for English. Slower, more precise.
 Multilingual Whisper Tiny Supports 99 languages.
 
-Download states: Downloaded / Not downloaded / Downloading / Failed. Model labels use plain language — never "model."
+Bad transcript detection: Empty, known silence markers, under 3 words for audio > 10s, under 5% of estimated word count. Triggers suggestion UI.
 
-Bad transcript detection:
-
-Condition Response
-Empty or whitespace only Suggest Multilingual or Accurate
-Known silence markers ([silence], [music], [BLANK_AUDIO], [no speech], (silence)) Same
-Under 3 words for audio > 10s Same
-Under 5% of estimated word count Same
-
-Suggestion UI:
-
-```
-⚠️ No speech detected
-This can happen if the audio is in a different
-language, or if the recording is quiet.
-[ Try Multilingual ]  [ Try Accurate ]
-```
-
-Peaks: A compact float array (~100–200 values) is included in the payload for instant waveform rendering.
+Peaks: Compact float array (~100–200 values) included in payload.
 
 Max duration: 30 minutes.
 
 11.10 Read-Aloud (TTS)
 
-Mode toggle in composer:
+Mode toggle in composer (grey off, accent-filled on). Long-press opens options sheet (speed, voice, "Read from here"). Persists across sessions.
 
-```
-[＋] [😊] [🔊] [  Message...  ] [🎤]
-              ↑
-       read-aloud toggle
-```
-
-· Grey icon when off; accent-filled when on
-· Tap toggles mode
-· Long-press opens options sheet (speed, voice, "Read from here")
-· Persists across sessions
-· On narrow screens (< 360px), consolidate [＋] and [😊] into [＋] menu
-
-Applies to every readable bubble:
-
-Bubble type Read aloud?
-Text message Yes
-Voice message transcript Yes
-Caption on a media message Yes
-Message with an attachment and no caption Reads the filename
-Link preview Reads the title and description
-System message Yes
-Sticker No
-Image without caption No
-Tombstone Yes
+Applies to: Text messages, voice transcripts, captions, messages with attachments and no caption (reads filename), link previews (title + description), system messages, tombstones. Not stickers or images without captions.
 
 Sentence-level control:
 
-· Messages are pre-segmented into sentences client-side
-· Each sentence is a tap target
-· Tapping any sentence starts/jumps playback to that sentence
-· Currently-speaking sentence has a subtle highlight
+· Messages pre-segmented into sentences client-side.
+· Each sentence is a tap target.
+· Tapping a sentence starts/jumps to it.
+· Currently-speaking sentence has subtle highlight.
 
-```
-┌───────────────────────────────────────────┐
-│  Hey, just checking in about the meeting. │
-│  Are we still on for 3pm?                 │  ← currently speaking, highlighted
-│  Let me know when you get a chance.       │
-└───────────────────────────────────────────┘
-```
-
-Auto-resume:
-
-· Position stored per-message
-· Tapping the same bubble resumes from where it stopped
-· Cleared on: message completion, "Restart" action, message edit, 24-hour expiry
-
-Long-press options:
-
-```
-Read aloud                          [✕]
-● Resume from where it stopped
-○ Restart from beginning
-○ Choose starting point
-Speed  [0.75×] [1.0×] [1.25×] [1.5×] [2.0×]
-Voice  [ Default ▾ ]
-```
-
-"Choose starting point" opens the message with tappable sentences.
+Auto-resume: Position stored per-message. Cleared on message completion, "Restart," message edit, 24-hour expiry.
 
 TTS model: Supertonic 3 (~400 MB ONNX). 31 languages. WebGPU + WASM. 100% local. Downloaded on first use. Cached via Cache API. Never calls an external CDN.
 
-Per-message action (mode off): Accessible via context menu.
+Screen reader coexistence: Detect OS screen reader; offer to disable our read-aloud.
 
-Screen reader coexistence: Detect OS screen reader; offer to disable our read-aloud. If the user explicitly enables our mode, it takes precedence.
-
-Keyboard shortcut: Ctrl/Cmd + Shift + R toggles mode from anywhere.
-
-Settings → Accessibility → Read aloud by default: When enabled, new rooms open with read-aloud mode active.
-
-Room Settings → Override global setting: Always / Never / Default.
+Keyboard shortcut: Ctrl/Cmd + Shift + R toggles mode.
 
 11.11 Stickers and Emoji
 
@@ -1300,60 +1181,36 @@ Stickers:
 Tier Source Delivery
 Bundled Ships with the app Static assets
 Shared pack Encrypted attachment Cached locally
-Custom User-created from camera roll Processed as media
+Custom User-created Processed as media
 
-Pack manifest: JSON with id, name, publisher, version, tray_image, and stickers[]. Each sticker has id, format (webp or lottie), file, width, height, emojis, keywords, and optional duration_ms.
+Pack manifest: JSON with id, name, publisher, version, tray_image, stickers[].
 
-Animated stickers: Lottie JSON, rendered via dotlottie-web with expressions disabled.
+Animated stickers: Lottie JSON via dotlottie-web with expressions disabled.
 
-Message payload: { "type": "sticker", "pack_id": "...", "sticker_id": "...", "entrance": "pop" }.
+Entrance transitions: none, pop, drop, slide, crash, fade. Respects prefers-reduced-motion.
 
-Entrance transitions: none, pop, drop, slide, crash, fade. Plays on first view of a new message. Respects prefers-reduced-motion. Replay on tap.
+Sticker combination: Long-press a sticker → "Combine" → multi-select up to 6 → drag, resize, rotate → send. Rendered to a canvas and sent as an image attachment.
 
-Sticker combination: Long-press a sticker in the picker → "Combine" → multi-select up to 6 → drag, resize, rotate → send. Rendered to a canvas and sent as an image attachment.
-
-Sticker suggestions: A keyword-to-sticker mapping runs locally as the user types.
-
-Native keyboard sticker limitation: iOS and Android do not expose a public API for WebView-based apps to receive stickers from the system keyboard. Android's Commit Content API requires a native EditText; the WebView's <input> is not a native editor. iOS has no public API at all.
-
-Paste-as-sticker: When an image is pasted into the composer, the client detects it and offers a choice if the image is small and square (heuristic: under 512×512, aspect ratio close to 1:1):
-
-```
-Send as:
-[ Sticker ]  [ Image ]
-```
-
-· Sticker: Added to the user's custom sticker collection and sent as message_type: "sticker".
-· Image: Goes through the normal attachment pipeline.
-
-The choice is remembered for future pastes.
-
-Education:
-
-· First-use hint near the sticker button (once)
-· Paste-aware tooltip (once per device)
-· Settings → Chats → Stickers help entry
+Native keyboard limitation: Documented. Paste-as-sticker fallback for small square images.
 
 11.12 Link Previews
 
-Generated client-side by the sender. The preview (title, description, site name, favicon, and optionally an image) is embedded in the message payload.
-
-Fetch: Debounced (500ms) after URL detection. 3-second timeout. If the fetch fails, fall back to a minimal card showing only the domain and URL.
+Generated client-side by the sender. Debounced (500ms). 3-second timeout. Fallback to minimal card with domain and URL on failure.
 
 Multiple links: Only the first URL gets a preview.
 
-Opt-in server proxy: For URLs blocked by CORS, an optional server-side proxy can fetch metadata. Uses agent-fetch for SSRF protection. No logging, encrypted URL relay.
+Opt-in server proxy: For CORS-blocked URLs, an optional server proxy can fetch metadata. Uses agent-fetch for SSRF protection. No logging, encrypted URL relay.
 
 11.13 Reply / Quote
 
 · Trigger: Swipe right on mobile; hover bar or right-click → Reply on desktop.
-· Preview bar above the composer shows the quoted sender and snippet.
-· Quoted snippet appears inside the reply bubble, tappable to jump to the original.
+· Preview bar above composer shows quoted sender and snippet.
+· Quoted snippet tappable to jump to original.
 · Payload: reply_to: "<message_id>".
 
 11.14 @Mentions
 
-Composer autocomplete: Typing @ opens a popover listing room members. Filtering is prefix-based. Selection is required — typed mentions without selection are plain text.
+Composer autocomplete: typing @ opens a popover listing room members. Prefix-based filtering. Selection required.
 
 Payload:
 
@@ -1367,7 +1224,7 @@ Payload:
 }
 ```
 
-Rendering: Accent color pill, tappable to profile. Mentions of the current user get additional emphasis.
+Rendering: Accent-color pill, tappable to profile. Mentions of current user get additional emphasis.
 
 Notification override: Mentions override mute but not "Nothing."
 
@@ -1379,7 +1236,7 @@ Supported: bold, italic, strikethrough, inline code, links, bullet lists, number
 
 11.16 Message Tombstone
 
-When a message is deleted, the bubble is replaced in place with a muted pill: "This message was deleted."
+Deleted message bubble replaced in place with muted pill: "This message was deleted."
 
 11.17 In-Thread Search
 
@@ -1391,53 +1248,33 @@ When a message is deleted, the bubble is replaced in place with a muted pill: "T
 
 11.18 Global Search
 
-A search field in the chat list header. Searches room names and message content. Results group by room.
+Search field in the chat list header. Searches room names and message content. Results group by room.
 
 11.19 Disappearing Messages
 
-Room-level timer stored in the encrypted metadata JSON.
+Room-level timer stored in encrypted metadata JSON.
 
-Options: Off, 24h, 7d, 90d.
+Options: Off, 24h, 7d, 90d. Who sets: Room owner only. Applies to: New messages only.
 
-Who sets it: Room owner only.
+Timer start: At send time. Sender computes expires_at and includes it in the payload.
 
-Applies to: New messages only.
+Cleanup: Local-only periodic task queries SELECT id FROM messages WHERE expires_at <= now.
 
-Timer start: At send time. The sender computes expires_at and includes it in the payload.
-
-Cleanup: Local-only periodic task queries SELECT id FROM messages WHERE expires_at <= now, deletes those rows, and removes associated attachments from the local cache if no other message references them.
-
-Interactions:
-
-· Edits inherit the original's expires_at.
-· Replies show [message expired] after expiration.
-· Curation views reflect the removal.
-· Search indexes updated on delete.
-
-Server involvement: None. The timer travels in the encrypted metadata.
+Interactions: Edits inherit expires_at. Replies show [message expired] after expiration. Curation views reflect removal. Search indexes updated on delete.
 
 11.20 Nicknames
 
 Per-user aliases for room participants.
 
-Where shown:
+Where shown: Chat thread sender names, member list, reply preview, mention autocomplete, profile view.
 
-· Chat thread sender names
-· Member list
-· Reply preview
-· Mention autocomplete
-· Profile view
+Not shown: To other members (nicknames are user-scoped). On the user's own messages.
 
-Not shown:
-
-· To other members (nicknames are user-scoped)
-· On the user's own messages
-
-Edit UI: Room Settings → Customise chat → Edit nicknames. Sub-view with a text field per member.
+Edit UI: Room Settings → Customise chat → Edit nicknames.
 
 Storage: Local in room_preferences; synced via user_preferences key nicknames:{room_id}.
 
-Fallback: If no nickname is set, the member's display name is used.
+Fallback: Member's display name.
 
 ---
 
@@ -1458,11 +1295,11 @@ Text input Auto-growing textarea
 
 12.2 Reply Preview
 
-A bar above the composer, part of the glass overlay. Composer height updates via ResizeObserver.
+Bar above the composer, part of the glass overlay. Composer height updates via ResizeObserver.
 
 12.3 Attachment Preview
 
-Between pick and send, a preview screen shows the processed result with thumbnail, filename, size, quality override, caption input, remove, and reorder.
+Between pick and send, a preview screen shows processed result with thumbnail, filename, size, quality override, caption input, remove, reorder.
 
 12.4 Enter Key Behavior
 
@@ -1473,18 +1310,38 @@ Tablet (physical keyboard) Send Newline
 
 12.5 Focus Behavior
 
-After sending, focus remains in the input. Virtual keyboard stays open on mobile. User dismisses manually via swipe-down on the message list.
+After sending, focus remains in the input. Virtual keyboard stays open on mobile.
 
 12.6 Multi-Attachment Layout
 
 Count Layout
 1 image Full-width
 2 images Two equal columns
-3 images Left spans full height; right has two stacked
+3 images Left full-height; right has two stacked
 4 images 2×2 grid
 5+ images 2×2 grid with +N overlay
 
 Files render as stacked cards below the image grid. Caption renders last.
+
+12.7 Extension Slots on the Composer
+
+core.chat declares these slots on its detail surface:
+
+Slot Renders Multiple
+chat.composer.above Strip between reply preview and composer Yes
+chat.composer.attachMenu Items in the ＋ popover Yes
+chat.composer.leading Element before the ＋ button No
+chat.composer.trailing Element after the send/mic button No
+
+chat.composer.attachMenu is the recommended integration point for extensions. Each filler renders a single row in the ＋ popover: icon, label, tap handler. The host provides row chrome; the extension supplies icon, label, and behavior.
+
+Composer state is private. Extensions cannot read the draft, cursor position, or selection. Extensions ask the composer to do things via public events (§26.7):
+
+· chat:insert-text — insert text at start / end / cursor
+· chat:focus — focus the composer
+· chat:set-draft — replace the draft
+
+Extensions cannot send on the user's behalf.
 
 ---
 
@@ -1510,46 +1367,44 @@ Default avatar: ui-profile-group composite.
 · Remove member: owner (or moderator in Discord mode).
 · Promote/demote: owner (Discord mode only).
 
-Member list display: Member rows show profile image and display name (with nickname override). Display name resolution chain:
+Member list display: Member rows show profile image and display name (with nickname override).
 
-1. Cached display name (from previous decryption or message payload)
-2. Message payload (sender's display name is inside MLS-encrypted messages)
-3. encrypted_display from member list response (only if token is cached for that user)
+Display name resolution chain:
+
+1. Cached display name
+2. Message payload (sender's display name inside MLS-encrypted messages)
+3. encrypted_display from member list response (only if token cached for that user)
 4. Fallback: user_id or "Member" placeholder
 
-Practical consequence: Member lists show placeholders until a message is received from that member. Once the first message arrives, the display name resolves.
+Practical consequence: Member lists show placeholders until a message is received from that member.
 
 13.3 Invite Links and QR
 
 · Room-specific invite tokens.
 · Default expiration: 7 days.
 · Display: QR (via qr-code-styling), copy link, OS share sheet.
-· Regenerate invalidates the current link and issues a new one.
+· Regenerate invalidates current link and issues a new one.
 · Scanning: camera (Capacitor) or paste (desktop).
 
 13.4 Username Lookup
-
-Full cycle:
 
 Phase 1 — User taps "Add member." Sheet opens with a single Username field.
 
 Phase 2 — Lookup (invisible):
 
 Step Where What happens
-1 Client Blinds the username with a random factor
+1 Client Blinds username with a random factor
 2 Client → Server POST /oprf/blind
 3 Server OPRF evaluation with k
 4 Client Unblinds → token
 5 Client → Server POST /users/lookup { username_token }
-6 Server Matches token, returns { user_id, encrypted_display }
+6 Server Matches token, returns { user_id, encrypted_display } (200) or { error: "not_found" } (404)
 7 Client Derives display_name_key from token
 8 Client Decrypts display name
 
-Server saw two opaque values. Never saw the plaintext username or display name.
+Response semantics (Amendment 32): Found returns 200 with { user_id, encrypted_display }. Not-found returns 404 with { error: "not_found" }. Rate limiting is the enumeration defense; timing padding is not applied.
 
-Rate limiting: OPRF endpoint rate-limited. Client surfaces: "Too many attempts. Please wait a moment and try again."
-
-Phase 3 — Confirmation card. On success: profile image + display name + username + "Add to room" button. On failure: hint card with case-sensitivity, no-spaces, full-username reminders. Fallback: "Invite via link instead."
+Phase 3 — Confirmation card. On success: profile image + display name + username + "Add to room" button. On failure: hint card. Fallback: "Invite via link instead."
 
 Phase 4 — Adding to room:
 
@@ -1563,29 +1418,18 @@ Step What happens
 
 System message: "You added Alex."
 
-Phase 5 — Recipient side. Online: receives mls.welcome_ready, fetches welcome, processes, fetches messages from welcome epoch, room appears. Offline: push notification. On open, processes pending welcome.
+Phase 5 — Recipient side. Online: receives mls.welcome_ready, fetches welcome, processes, fetches messages from welcome epoch. Offline: push notification.
 
-Phase 6 — Post-add. Display name cached locally. Future messages carry sender's display name inside encrypted payload.
-
-Failure modes:
-
-Failure Recovery
-Username doesn't exist Retry or invite link
-Rate-limited Wait and retry
-Already a member Toast
-Room full Toast
-MLS add fails Retry; client-mls-request after 5min
+Phase 6 — Post-add. Display name cached locally.
 
 13.5 Room Settings
 
 Display pattern:
 
-· Desktop (≥1024px): Off-canvas right drawer within Panel 3. Width min(480px, 40%). No backdrop scrim. Dismiss: X, Escape, click outside.
+· Desktop (≥1024px): Off-canvas right drawer within Panel 3. Width min(480px, 40%). No backdrop scrim. Dismiss: X, Escape, click outside. Routable as ?rail=chat&detail=room-settings.
 · Mobile: Full-screen modal with X.
 
-Header: Room Settings title with X on the right. No gear icon.
-
-Profile block: Room avatar, name, E2EE badge directly below.
+Profile block: Room avatar, name, E2EE badge below.
 
 Sections (disclosure pattern, collapse state persisted in room_preferences):
 
@@ -1600,11 +1444,9 @@ Moderation Moderation mode Owner (Discord mode)
 Danger Zone Transfer ownership, Delete room Owner
 Leave room — All
 
-1:1 rooms replace Members/Invites with a "This conversation" section (Block, Delete chat).
+1:1 rooms replace Members/Invites with "This conversation" (Block, Delete chat).
 
-Icon circles on each row (consistent color scheme: accent for positive actions, neutral grey for informational, danger red for destructive).
-
-Destructive actions: Delete room and transfer ownership require type-to-confirm. Kick and leave use single-confirmation dialogs.
+Icon circles on each row. Destructive actions require type-to-confirm. Kick and leave use single-confirmation dialogs.
 
 13.6 Room Metadata JSON
 
@@ -1625,7 +1467,7 @@ Encrypted with room_metadata_key.
 
 1. Tap avatar in Room Settings → Profile (owner only).
 2. Source sheet: Camera / Photo library / Remove photo.
-3. Circular crop (1:1 aspect ratio, drag, pinch/scroll to zoom).
+3. Circular crop (1:1 aspect ratio).
 4. Multi-size preview.
 5. Upload as encrypted attachment; update metadata JSON; broadcast room.updated.
 
@@ -1633,32 +1475,24 @@ Constraints: 20 MB max source, 128×128 min, JPEG/PNG/WebP/AVIF/HEIC. Output 512
 
 13.8 Room List Ordering
 
-Default: Fixed by join date. New rooms append to the bottom. Activity does NOT reorder the list.
+Default: Fixed by join date. New rooms append to the bottom.
 
 Manual reordering: Activated from the room list header menu. Drag handle on each row. Keyboard alternative: Alt+↑ / Alt+↓. "Reset to default" reverts to join date.
 
 Order persists locally and syncs across devices via PATCH /users/me/room-order.
 
-Filters:
-
-Filter Behavior
-Unread only Show only rooms with unread messages
-Mentions only Show only rooms with unread mentions
-Muted rooms Show only muted rooms
-Active hangouts Show only rooms with active hangouts
-
-Reorder mode is disabled while filters are active.
+Filters: Unread only, Mentions only, Muted rooms, Active sessions. Reorder mode is disabled while filters are active.
 
 13.9 Conversation Row Content
 
 Position Content
 Left ui-profile (composite for groups)
-Top line Room name (bold if unread) + optional hangout indicator
+Top line Room name (bold if unread) + optional session indicator
 Bottom line Last message preview, or typing indicator, or draft
 Top right Timestamp
 Bottom right Unread badge or mute icon
 
-Hangout indicator: small headphones icon + count inline next to the room name when the room has an active hangout. Uses the hangout's own icon if there's exactly one active hangout; a generic icon + count if multiple.
+Session indicator: small headphones icon + count inline next to the room name when the room has an active session.
 
 Indicators (prioritized):
 
@@ -1682,13 +1516,13 @@ Sticker Sender: [Sticker]
 Tombstone Falls back to previous non-tombstoned message
 System message Falls back to previous message
 
-Typing indicator replaces the preview: Alex is typing....
+Typing indicator replaces preview: "Alex is typing…"
 
 13.10 Leaving and Deletion
 
 · Leave room (all members): Confirmation; warns if last member.
 · Delete room (owner): Type-to-confirm. Other members receive room.deleted, room removed locally, system message: "This room was deleted by [owner]."
-· Rejoining after leaving: Fresh view from rejoin forward. Historical messages from before the leave are not re-delivered (MLS forward secrecy).
+· Rejoining after leaving: Fresh view from rejoin forward.
 
 13.11 Member Roles
 
@@ -1714,61 +1548,30 @@ Change disappearing timer ✅ ❌ ❌
 
 Combined photos and videos in a single grid. Grouped by date, newest first.
 
-```
-Today
-▢ ▶ ▢
-▢ ▢ ▶
-Yesterday
-▢ ▢ ▢
-Sep 23
-▢ ▢ ▢
-```
-
 Layout: 3-column flush grid. Square thumbnails with object-fit: cover.
 
-Video thumbnails:
-
-· Centered play icon overlay (semi-transparent black circle, white triangle)
-· Duration badge in bottom-right corner (0:15, 1:23:45)
-· Poster frame from the media pipeline
-
-Section headers: Small, muted, left-aligned. Not sticky.
-
-No per-tile date overlay. Date is in the section header.
+Video thumbnails: Centered play icon, duration badge bottom-right, poster frame from media pipeline.
 
 Inline video preview:
 
 · Desktop: hover with 250ms intent delay. Muted, looping, streaming.
 · Mobile: long-press with 250ms hold. Muted, looping, streaming.
-· Bound: the gesture duration. No byte or time cap.
-· Only gate: prefers-reduced-motion: reduce disables preview entirely. Static poster with play icon.
+· prefers-reduced-motion: reduce disables preview entirely.
 · Prefetch: first 2–3 chunks of visible videos during idle.
-· State: single global preview; clean teardown on switch. Decrypted chunks persist in the range cache.
-
-Empty state: "No media yet. Photos and videos shared in your chats will appear here."
 
 14.2 Documents and Links
 
 · List groups using list-row. Grouped by date (newest first).
-· Documents show file-type icon (including audio category), filename, size, sender, date.
+· Documents show file-type icon, filename, size, sender, date.
 · Links show favicon, title, domain, sender, date.
 
 14.3 Filter and Search
 
 Filter chips hidden by default behind a filter icon in the header.
 
-Filter sheet:
-
-Filter Options
-Chat All chats / specific
-Date Today / Last 7 days / Last 30 days / Custom
-Media type All / Photos / Videos
-Sender Any / specific
-Starred All / Starred only
+Filter sheet options: Chat, Date, Media type, Sender, Starred.
 
 Active filters appear as dismissible pills in the header.
-
-Search icon toggles search visibility (not always shown).
 
 Search fields: filename, sender, chat (media); title, domain, sender, chat (links).
 
@@ -1776,170 +1579,52 @@ Threshold: 0.35. includeMatches: true for highlighting.
 
 14.4 "View in Chat" Action
 
-Opens /app.html?view=chat&id=:roomId&messageId=:msgId. Scrolls to the message, highlights for 2s. If the message is tombstoned, a system notice appears.
-
-Label: "View in chat" in overflow menus. "View in chat — See the message and its conversation" with sub-line in info sections.
-
-Icon: chat bubble glyph.
+Opens ?rail=chat&detail=chat&id=:roomId&messageId=:msgId. Scrolls to the message, highlights for 2s.
 
 14.5 Media Viewer
 
 Scoping:
 
-Opened from Source list
+Opened from List
 Chat thread All media in the current room, chronological
 Curation view The currently filtered list
 
-List-detail navigation (see §6.6): horizontal swipe on mobile, hover arrows + keyboard on desktop. Position indicator in header (Media · 3 of 47).
+List-detail navigation: horizontal swipe on mobile, hover arrows + keyboard on desktop.
 
 Scrolling: CSS Scroll Snap (scroll-snap-type: x mandatory).
 
 Morph: View Transitions API.
 
-Navigation: Arrows (desktop), swipe (mobile), keyboard (←/→).
+Zoom and pan: Pinch, double-tap, scroll wheel. Min 1×, max 5×. Drag to pan when zoomed.
 
-Zoom and pan (images):
+Swipe-to-dismiss: Swipe down dismisses at 1×; when zoomed, swipe down pans.
 
-· Pinch, double-tap, scroll wheel.
-· Min 1×, max 5×.
-· Drag to pan when zoomed; drag at 1× navigates.
-· Zoom resets per slide.
+Action bar (top, glass chrome): Save, Share, Copy, View in chat, Delete (if owner), Info, Star.
 
-Swipe-to-dismiss:
-
-· Swipe down dismisses at 1×; when zoomed, swipe down pans.
-· Escape (desktop) or click outside dismisses.
-· Back button (mobile) dismisses.
-
-Action bar (top, glass chrome):
-
-Action Availability
-Save Always
-Share Always
-Copy Always
-View in chat Always
-Delete Only if the current user uploaded the attachment
-Info Always
-Star Always
-
-Thumbnail strip: Bottom of the viewer. Virtualized (±20 items). Two-way sync with the main slideshow. Thumbnails decrypted and cached locally (128×128 WebP). Generation is lazy and runs in a Web Worker.
-
-Video:
-
-· <video> element in a slide.
-· IntersectionObserver pauses playback when the slide scrolls out of view.
-· Poster frame shows while loading.
-· Auto-play respects the Auto-download media setting.
+Thumbnail strip: Bottom of viewer. Virtualized (±20 items). Two-way sync with main slideshow.
 
 Prefetching: Active slide ±2 for decryption. Thumbnails ±20.
 
-Closing behavior:
-
-Trigger Effect
-Swipe down Dismiss
-Tap outside Dismiss
-Escape (desktop) Dismiss
-Share Opens OS share sheet; viewer stays open
-Save Saves; toast confirms; viewer stays open
-View in chat Closes viewer; navigates
-Delete Confirmation; viewer moves to next item or closes
-
 14.6 Document Detail
 
-New view. Shares layout with link detail.
-
-```
-┌─────────────────────────────────────────┐
-│  ←  Document · 5 of 23              [⋯] │
-│                                         │
-│  ┌───────────────────────────────────┐  │
-│  │       [PDF preview or              │  │
-│  │        file icon]                  │  │
-│  └───────────────────────────────────┘  │
-│                                         │
-│  Q3-report.pdf                          │
-│  2.4 MB · PDF · 12 pages                │
-│                                         │
-│  [ Open in app ]                        │
-│                                         │
-│  [ Copy ]  [ Share ]  [ Star ]          │
-│                                         │
-├─────────────────────────────────────────┤
-│  Shared by thomas                       │
-│  In Design Team                →        │
-│  3 weeks ago                            │
-└─────────────────────────────────────────┘
-```
-
-Preview behavior:
+Shares layout with link detail. Preview behavior:
 
 Category Preview
 PDF Inline viewer via <embed> or <iframe> on a blob URL
 Image-as-doc Rendered as an image
 Video-as-doc Rendered as a video
-Audio-as-doc Rendered as an audio player (message-audio-player)
+Audio-as-doc Rendered as an audio player
 Text Plain text render, monospace
 Code Syntax-highlighted via highlight.js
-Office Not previewed; file card with "Open in app"
-Archives Not previewed; file card with "Open in app"
-Unknown Not previewed; file card with "Open in app"
+Office / Archives / Unknown File card with "Open in app"
 
-"Open in app": On mobile, uses @capacitor/filesystem and @capacitor/share. On desktop, openPath() from tauri-plugin-shell. On web, a download link.
+"Open in app": Capacitor Filesystem + Share (mobile), openPath() from tauri-plugin-shell (desktop), download link (web).
 
 14.7 Link Detail
 
-New view.
+Elements: OG preview image, favicon + domain, title, description, "Open in browser," Copy/Share/Star chips, info section (shared by, in room, date), message context card with "View in chat."
 
-```
-┌─────────────────────────────────────────┐
-│  ←  Link · 12 of 47                 [⋯] │
-│                                         │
-│  ┌───────────────────────────────────┐  │
-│  │      [OG preview image]           │  │
-│  └───────────────────────────────────┘  │
-│                                         │
-│  🌐 davidproduction.jp                  │
-│  株式会社デイヴィッドプロダクション      │
-│  アニメーションスタジオ...              │
-│                                         │
-│  [ Open in browser ]                    │
-│                                         │
-│  [ Copy ]  [ Share ]  [ Star ]          │
-│                                         │
-├─────────────────────────────────────────┤
-│  Shared by thomas                       │
-│  In Design Team                →        │
-│  3 weeks ago                            │
-│                                         │
-│  ┌───────────────────────────────────┐  │
-│  │  In the message                   │  │
-│  │  thomas: "Check out this studio,  │  │
-│  │  they made the animation for..."  │  │
-│  │  [ View in chat ]                 │  │
-│  └───────────────────────────────────┘  │
-└─────────────────────────────────────────┘
-```
-
-Elements:
-
-Element Behavior
-OG preview image Full-width, max-height ~50vh
-Domain with favicon Small favicon + domain, muted
-Title Large, wraps to multiple lines
-Description Muted, max 4 lines with ellipsis
-Open in browser Primary action, accent-colored, full-width
-Copy / Share / Star Row of chip-style buttons
-Info section Shared by, In [room], date (relative, locale-aware)
-Message context card Compact preview of the original message with "View in chat"
-Overflow menu Copy link, Share, Star/Unstar, Delete (if owner)
-
-Empty/error states:
-
-State Display
-Preview image failed to load Solid color placeholder with domain initial
-OG fetch failed at share time Domain-only card
-Link no longer reachable No special treatment; browser handles
-Attachment (OG image) missing Placeholder; no error
+Empty/error states: Solid color placeholder with domain initial; domain-only card; browser handles unreachable links; placeholder for missing OG image.
 
 14.8 Curation Empty States
 
@@ -1952,29 +1637,13 @@ Starred filter "No starred items yet. Star anything to find it here."
 
 ---
 
-15. Calls and Hangouts
+15. Calls and Sessions
 
 15.1 Call Model
 
 Room-scoped. A 1:1 call is a 2-member room. A group call is a room with 3+ members.
 
 15.2 Pre-Call Preview
-
-```
-┌─────────────────────────────────────────┐
-│  ←   Call                          [✕]  │
-│                                         │
-│         [Camera preview or profile]     │
-│                                         │
-│         Alex, Sam + 2                   │
-│         Design Team                     │
-│                                         │
-│  [🎤 Mic: On]  [📷 Camera: Off]        │
-│                                         │
-│  [      Start Voice Call      ]         │
-│  [      Start Video Call      ]         │
-└─────────────────────────────────────────┘
-```
 
 Default: voice, camera off, mic on. Background blur optional.
 
@@ -1990,27 +1659,21 @@ Voice 1:1: Profile-centric. Controls: speaker, mute, switch to video, minimize, 
 
 Voice group: Grid (up to 9 profiles) or list view with mic/video status. Active speaker highlighted with a green ring.
 
-Video 1:1: Remote video full-screen; self-view as draggable PiP. Controls: speaker, mute, flip camera, minimize, end.
+Video 1:1: Remote video full-screen; self-view as draggable PiP.
 
 Video group: Grid (up to 6) or focus view with filmstrip.
 
 15.5 Minimized Call
 
-Picture-in-picture floating window, draggable. On desktop, the call can dock into a resizable pane within Panel 3.
+PiP floating window, draggable. On desktop, the call can dock into a resizable pane within Panel 3.
 
 15.6 Call History
 
-Calls tab in the rail (and bottom nav on mobile). Rows show profile, room name, call type, direction (incoming / outgoing / missed), duration, timestamp.
+Calls tab in the rail (and bottom nav on mobile). Rows show profile, room name, call type, direction, duration, timestamp.
 
-Group calls over the participant cap: The call starts with the first N who accept. Additional members see: "This call is full."
+15.7 Sessions
 
-Call history and disappearing messages: Call history is not affected by the room's disappearing timer.
-
-Room deletion during a call: The call ends with reason: "room_deleted".
-
-15.7 Hangouts
-
-Persistent, named, room-scoped voice spaces.
+Sessions are persistent, named, extension-owned, room-scoped real-time spaces. The mechanism is defined in Server Spec Amendment 35. This section describes the client UX for the reference type — the voice session — and the general contract that all session types follow.
 
 Properties:
 
@@ -2025,17 +1688,13 @@ Entry point: Headphones icon in the room header (see §6.7).
 Header icon states:
 
 State Treatment
-No hangouts Icon present, no badge
-Hangouts exist, none active Subtle dot
-Active hangouts Count badge (total participants)
+No sessions Icon present, no badge
+Sessions exist, none active Subtle dot
+Active sessions Count badge (total participants)
 
-Hangout list sheet (opened from header icon):
+Session list sheet (opened from header icon): all sessions in the room, each with name, icon, participant count, join action. "Create session" action at the top.
 
-· All hangouts in the room
-· Each with name, icon, participant count, join action
-· "Create hangout" action at the top
-
-Active strip: Appears above the message thread when at least one hangout has participants.
+Active strip: Appears above the message thread when at least one session has participants.
 
 ```
 ┌───────────────────────────────────────────┐
@@ -2045,9 +1704,9 @@ Active strip: Appears above the message thread when at least one hangout has par
 
 · Single line, ~48px height
 · Only present when participants > 0
-· If multiple hangouts are active, stack or scroll horizontally
+· If multiple sessions are active, stack or scroll horizontally
 
-In-hangout bar: Replaces the active strip when the user has joined.
+In-session bar: Replaces the active strip when the user has joined.
 
 ```
 ┌───────────────────────────────────────────┐
@@ -2055,22 +1714,20 @@ In-hangout bar: Replaces the active strip when the user has joined.
 └───────────────────────────────────────────┘
 ```
 
-Full hangout view:
+Full session view:
 
 · Room name at the top
-· Hangout name as the title
+· Session name as the title
 · Participant grid (roster)
 · Controls: mic, speaker, camera, screen share, leave
-· On desktop: opens in Panel 3
+· On desktop: opens as a centered overlay over the content area (see §26.5)
 · On mobile: full-screen sheet
-
-List-detail navigation: The hangout list supports horizontal navigation through hangouts in the room. Position indicator in header.
 
 Create/Edit sheet:
 
 ```
 ┌─────────────────────────────────────────┐
-│  New hangout                       [✕]  │
+│  New session                       [✕]  │
 │                                         │
 │  Name                                   │
 │  [ The Lounge                 ]         │
@@ -2085,13 +1742,11 @@ Create/Edit sheet:
 └─────────────────────────────────────────┘
 ```
 
-Metadata encryption: hangout_metadata_key = HKDF(RMK, "hangout-metadata-v1", 32).
+Metadata encryption: session_metadata_key = HKDF(RMK, "session-metadata-v1", 32).
 
-Icon attachment: Encrypted with C2SP context "attachment" || 0x00 || "hangout-icon" || 0x00 || room_id.
+Icon attachment: Encrypted with C2SP context "attachment" || 0x00 || "session-icon" || 0x00 || room_id.
 
-Icon fallback: If the attachment is missing or unfetchable, fall back to the emoji variant or a default icon. Do not surface an error.
-
-15.8 Hangout Client Behavior
+15.8 Session Client Behavior
 
 Joining:
 
@@ -2114,25 +1769,25 @@ Leaving:
 
 Room deletion:
 
-· Server publishes hangout.deleted for every hangout in the room.
-· Client MUST tear down media on receiving hangout.deleted.
+· Server publishes session.deleted for every session in the room.
+· Client MUST tear down media on receiving session.deleted.
 
 Reconnect:
 
 · On WebSocket disconnect and reconnect, client does NOT auto-rejoin.
-· Shows hangout as "disconnected" with a rejoin action.
-· Fetches GET /rooms/:id/hangouts on reconnect to refresh counts.
+· Shows session as "disconnected" with a rejoin action.
+· Fetches GET /rooms/:id/sessions on reconnect to refresh counts.
 
 Multi-device:
 
-· A user may have multiple client_ids in a hangout.
+· A user may have multiple client_ids in a session.
 · Client uses the same stable client_id as for MLS.
 · Leaving from one device does not remove the user if another device is still present.
-· If the user is in a hangout on device A and opens the room on device B, device B shows "You're in this on another device." Device B can call POST .../leave { client_id: <device_A_id> } to leave on behalf of device A.
+· If the user is in a session on device A and opens the room on device B, device B shows "You're in this on another device." Device B can call POST .../leave { client_id: <device_A_id> } to leave on behalf of device A.
 
-Signal payload: hangout.signal includes target_client_id so recipients filter to the intended device.
+Signal payload: session.signal includes target_client_id so recipients filter to the intended device.
 
-15.9 Hangouts — Prohibitions
+15.9 Sessions — Prohibitions
 
 These are normative and protect the design:
 
@@ -2140,28 +1795,32 @@ These are normative and protect the design:
 2. Do not display identities to non-participants. Counts only.
 3. Do not log occupancy. No console logs, no analytics, no crash reports containing participant lists.
 4. Do not auto-rejoin. Rejoin is always a user action.
-5. Do not send notifications on hangout join.
-6. Do not put hangouts in call history.
-7. Do not synthesize presence. No "last seen in lounge," no "recently active in hangout."
+5. Do not send notifications on session join.
+6. Do not put sessions in call history.
+7. Do not synthesize presence. No "last seen in lounge," no "recently active in session."
 
-15.10 Hangout Rate Limits
+15.10 Session Rate Limits
 
-Client must respect:
+Client must respect the server's rate limits:
 
 · Create: 20/hour, 100/day
 · Join: 30/minute
-· Heartbeat: 10/minute per hangout (normal usage 4/minute)
+· Heartbeat: 10/minute per session (normal usage 4/minute)
 
 If heartbeat limit is hit, log locally and do not retry aggressively.
 
-15.11 Hangout Feature Disabled
+15.11 Sessions Feature Disabled
 
-If capabilities.hangouts_enabled=false:
+If capabilities.sessions_enabled = false:
 
-· Hangout metadata remains visible (read/patch/delete work)
+· Session metadata remains visible (read/patch/delete work)
 · Join/signal/heartbeat return 501
-· Client shows: "Hangouts are disabled on this server." when join is attempted
-· Existing hangouts can still be deleted by their creator/owner
+· Client shows: "Sessions are disabled on this server." when join is attempted
+· Existing sessions can still be deleted by their creator/owner
+
+15.12 Other Session Types
+
+Session types are declared by their owning extension (see §26.8). The voice type is the only one shipped in v1. Watch-together, collaborative games, and other real-time features are future extensions that use the same mechanism. The client's session infrastructure — join/leave/heartbeat/signal, the strip/bar/roster components, the list-detail navigation — is generic and supports any session type.
 
 ---
 
@@ -2205,37 +1864,15 @@ Registration flow (client):
 3. Encrypt display name with display_name_key.
 4. OPAQUE registration locally.
 5. POST /auth/register/finish { username_token, encrypted_display, opaque_record, identity_pubkey, altcha }.
-6. Server returns:
-   · session_token
-   · user_id
-   · Recovery codes (plaintext, shown once)
+6. Server returns: session_token, user_id, recovery codes (plaintext, shown once).
 7. Display recovery codes. Download is mandatory — Next disabled until downloaded.
 8. Confirmation: type the 3rd code back.
 9. Client caches the OPRF token.
 10. window.location.href = '/app.html'.
 
-Server-generated recovery codes. Hashed with Argon2id + per-code salt. Client never generates codes.
-
 16.4 Recovery View
 
 Separate flow, not a login-mode variant.
-
-```
-┌─────────────────────────────────────────┐
-│  ←  Recover access                      │
-│                                         │
-│  Username                               │
-│  [ alex_92                    ]         │
-│                                         │
-│  Recovery code                          │
-│  [ XXXX-XXXX-XXXX-XXXX        ]         │
-│                                         │
-│  New password                           │
-│  [ **********                 ]         │
-│                                         │
-│  [      Restore access      ]           │
-└─────────────────────────────────────────┘
-```
 
 Recovery flow (client):
 
@@ -2248,21 +1885,9 @@ Recovery flow (client):
 7. Server replaces OPAQUE record, consumes code, revokes all existing sessions, issues new session.
 8. Client stores new session, redirects to /app.html.
 
-Server behavior:
-
-· Recovery codes hashed with Argon2id + per-code salt.
-· Constant-time comparison.
-· Code consumed (single-use or decrement) on success.
-· Session revocation is mandatory.
-
 Other devices: receive session.revoked → clear session → redirect to index.html.
 
-Recovery code display screen (initial registration):
-
-· Codes shown once, must be downloaded.
-· Confirmation step requires typing one back.
-· Explicit warning: "These codes cannot be recovered if lost."
-· Regeneration only available from an authenticated session.
+Recovery code display screen (initial registration): Codes shown once, must be downloaded. Confirmation step requires typing one back. Explicit warning: "These codes cannot be recovered if lost." Regeneration only available from an authenticated session.
 
 16.5 Biometric Unlock
 
@@ -2278,8 +1903,6 @@ Biometric login flow: Biometric unlocks the OPAQUE record → username retrieved
 
 16.6 Device Linking
 
-Adding a new device when an existing session is active:
-
 1. Existing device generates a device linking code (QR or short code).
 2. New device enters or scans the code.
 3. New device performs OPAQUE login with password.
@@ -2287,11 +1910,7 @@ Adding a new device when an existing session is active:
 5. New device fetches user-scoped sync state: GET /users/me/sync?since_seq=0.
 6. Device names and other user-scoped state populate.
 
-Device names:
-
-· Server stores encrypted_device_name as opaque ciphertext in user-scoped sync state.
-· Client encrypts with device_name_key = HKDF(token, "device-name-encryption-v1", 32).
-· Cross-device: device.name_updated event on private-user-{user_id}.
+Device names: Server stores encrypted_device_name as opaque ciphertext in user-scoped sync state. Client encrypts with device_name_key = HKDF(token, "device-name-encryption-v1", 32). Cross-device: device.name_updated event on private-user-{user_id}.
 
 16.7 Passkeys (V2 Seam)
 
@@ -2299,8 +1918,7 @@ Not in V1. Data-driven action list in the login view.
 
 16.8 Session Expiry
 
-Auth token expired → redirect to index.html.
-OPAQUE session expired → inline error.
+Auth token expired → redirect to index.html. OPAQUE session expired → inline error.
 
 16.9 Multi-Device Session Semantics
 
@@ -2328,7 +1946,7 @@ Single view. Search bar at the top. Rendered in Panel 3 (desktop) or full-screen
 17.1 Account
 
 Row Control
-Profile Navigate → display name (encrypted), profile image, username (read-only)
+Profile Navigate → display name, profile image, username (read-only)
 Password Navigate → change password
 Recovery codes Navigate → status, regenerate
 Devices Navigate → list, revoke
@@ -2337,8 +1955,6 @@ Passkeys Navigate → V2 placeholder
 Starred items Navigate → list
 
 Display name update: Re-encrypt with cached display_name_key and fresh nonce. PATCH /users/me { encrypted_display }.
-
-Device names: Encrypted locally, synced via user-scoped state.
 
 17.2 Privacy
 
@@ -2388,8 +2004,6 @@ Auto-read incoming messages Off
 Downloaded voices Navigate → list, remove
 Download additional voices Action
 
-Plain language throughout. No "model" terminology.
-
 17.8 Calls
 
 Default call mode, Call ringtone, Video quality, Show calls tab.
@@ -2398,19 +2012,20 @@ Default call mode, Call ringtone, Video quality, Show calls tab.
 
 Theme, Accent color, Wallpaper, Reduced motion, Sticker animations, Language.
 
-17.10 About
+17.10 Extensions
 
-Version, Terms, Privacy, Licenses, Log out, Log out and clear data, Delete account.
+Row Purpose
+Installed extensions List of all registered extensions with enable/disable toggle
+Network permissions Per-extension list of declared origins and user-entered origins
+Session types List of session types declared by installed extensions
+
+Reserved preference keys (room_order, _system:*) are not editable here.
 
 17.11 Starred Items
 
 Settings → Account → Starred items.
 
-List of all starred items (media, messages, links), filterable by type. Each row: thumbnail/icon, source (room name + sender), date starred. Tap to view.
-
-Unstar: Swipe or long-press → "Unstar."
-
-Empty state: "No starred items yet. Star anything to find it here."
+List of all starred items (media, messages, links), filterable by type. Unstar via swipe or long-press. Empty state: "No starred items yet. Star anything to find it here."
 
 17.12 Administration
 
@@ -2418,11 +2033,11 @@ Rendered only if capabilities.admin is present.
 
 17.13 Sign-Out and Account Deletion
 
-Log out: Session cleared, local data preserved (encrypted at rest).
+· Log out: Session cleared, local data preserved (encrypted at rest).
+· Log out and clear data: Everything cleared. Extension storage and preferences wiped.
+· Account deletion: Warning screen → type username to confirm → server anonymizes → local data wiped → Auth Gate.
 
-Log out and clear data: Everything cleared.
-
-Account deletion: Warning screen → type username to confirm → server anonymizes → local data wiped → Auth Gate.
+Account deletion server behavior (Amendment 33): username_token replaced with a random 86-character base64url string. encrypted_display and profile set to NULL.
 
 Recovery triggers session revocation on all other devices. Affected devices handle it via session.revoked.
 
@@ -2434,11 +2049,9 @@ Recovery triggers session revocation on all other devices. Affected devices hand
 
 Top of detail panel (desktop) / top of screen below status bar (mobile). One at a time. Auto-dismiss after 5s. Mute exception for mentions. No inline reply.
 
-Hangout events do NOT trigger notifications.
+Session events do NOT trigger notifications.
 
 18.2 Push Notifications
-
-Case matrix:
 
 App state WebSocket Mechanism
 Foreground, same room Connected No notification
@@ -2457,20 +2070,9 @@ Reply ✅ inline ✅ inline ❌
 Mark as read ✅ ✅ ✅
 Tap ✅ deep link ✅ deep link ✅ deep link
 
-Reply architecture: NSE decrypts, app process encrypts and sends.
+Notification categories: MESSAGE, MESSAGE_MUTED, MENTION, CALL, MEMBER_CHANGE.
 
-Screen lock interaction: Reply prompts biometric if Screen lock is on.
-
-Notification categories:
-
-Category Actions
-MESSAGE Reply, Mark as read
-MESSAGE_MUTED Reply
-MENTION Reply, Mark as read
-CALL Accept, Decline
-MEMBER_CHANGE (none)
-
-No push on hangout join.
+No push on session join.
 
 ---
 
@@ -2501,11 +2103,13 @@ User screenshots remain allowed.
 
 19.5 Deep Linking
 
-URL format: https://app.example.com/app.html?view=chat&id=r_abc123&messageId=m_xyz789
+URL format: https://app.example.com/app.html?rail=<id>&detail=<route>&id=<sel>
 
 Pending slot: In-memory only. Invite tokens use sessionStorage for auth-flow survival.
 
 Processing order: Boot → auth → sync start → route → clear.
+
+OAuth callback pattern: Extensions that integrate with OAuth services (Mastodon, Bluesky, etc.) use the deep-link mechanism to receive callbacks. The callback arrives as ?rail=<ext>&detail=oauth-callback&code=...&state=.... The extension's onActivate handler detects the route, exchanges the code, and calls ctx.navigate() to land on its list.
 
 Platform config:
 
@@ -2531,8 +2135,8 @@ Media empty "No media yet. Photos and videos shared in your chats will appear he
 Documents empty "No documents yet."
 Links empty "No links yet."
 Curation (filtered) no-results "No [media/docs/links] match your filters."
-Hangout list empty "No hangouts yet. Create one to start a voice space."
-Hangout list (filtered) no-results "No hangouts match your filters."
+Session list empty "No sessions yet. Create one to start a real-time space."
+Session list (filtered) no-results "No sessions match your filters."
 Starred items empty "No starred items yet. Star anything to find it here."
 Read-aloud voices empty "No voices downloaded. Download one to start reading aloud."
 Calls empty "No calls yet."
@@ -2542,6 +2146,8 @@ Custom stickers empty "No custom stickers yet"
 In-thread search empty "Nothing to search yet"
 
 Rules: Shared-rooms section hidden when empty. One primary action per state.
+
+Extensions may declare empty, loading, and error on their surfaces with either a declarative shape (icon, title, body, action) or a custom component. See §26.5.
 
 ---
 
@@ -2588,7 +2194,7 @@ MLS decrypt failure Mark "cannot decrypt"
 Key commitment mismatch Reject; warning
 Safety number changed Warning banner
 Key transparency failure Unverified
-OPRF failure Retry; app works without display-name decryption until it succeeds
+OPRF failure Retry; app works without display-name decryption
 
 21.5 Media Errors
 
@@ -2602,15 +2208,15 @@ Quota warnings at 80%, blocks at 95%. Write failure → in-memory mode with bann
 
 Out-of-sync epoch → "Syncing encryption state…". Missing welcome → poll every 5s; after 5min, "Waiting for a room member to add you". Pending MLS remove → room marked "left". Keystore corruption → wipe, mark rooms error, offer rejoin.
 
-21.8 Hangout Errors
+21.8 Session Errors
 
 Error Behavior
-403 not_a_participant (roster fetch) Do not fetch roster before joining. UI bug if it occurs.
-Join failure (501 feature disabled) "Hangouts are disabled on this server."
-Join failure (503 at capacity) "This hangout is full."
+403 not_a_participant (roster fetch) Do not fetch roster before joining
+Join failure (501 feature disabled) "Sessions are disabled on this server."
+Join failure (503 at capacity) "This session is full."
 Heartbeat timeout (3 consecutive) Show "Disconnected" state. Offer rejoin. Do not auto-rejoin.
-hangout.deleted received Tear down media. Toast: "This hangout was deleted."
-Signal delivery to wrong client Filter locally via target_client_id.
+session.deleted received Tear down media. Toast: "This session was deleted."
+Signal delivery to wrong client Filter locally via target_client_id
 Signaling failure (WebRTC) "Couldn't establish a connection. Try again."
 Rate limited on heartbeat Log locally. Do not retry aggressively.
 
@@ -2621,26 +2227,35 @@ TTS model download failure Toast: "Couldn't download voice. Tap to retry."
 Synthesis failure Toast: "Couldn't read this message."
 Bad transcript detected Suggestion UI (see §11.9)
 
-21.10 Interaction Edge Cases
+21.10 Extension Errors
+
+Error Behavior
+Extension component render failure Error boundary renders host-owned fallback. Rail icon remains clickable.
+Extension fetch (proxy) 502 upstream_response_too_large Extension retries with transport: 'direct'; one-time toast
+Extension fetch (proxy) disabled transport: 'proxy' fails; transport: 'auto' falls back to direct
+Extension network origin denied by user Extension handles error; no automatic retry
+
+21.11 Interaction Edge Cases
 
 Scenario Behavior
-Edit, then unsend Tombstone replaces the latest version
+Edit, then unsend Tombstone replaces latest version
 Unsend, then attempt to edit Edit option absent
 Disappearing message edited Edit inherits expires_at
 Reply to expiring message [message expired] after expiration
 Message during MLS transition Composer "Securing…"; send queued
 Same file in two rooms Stored separately (encryption binds to room_id)
 Member list without cached display name user_id placeholder until first message
-Star a message, then it's deleted Star persists locally as a standalone copy. Not shown in thread. Shown in Starred list.
+Star a message, then it's deleted Star persists locally as standalone copy
 Nickname set, then member leaves Nickname retained in local store
 Read-aloud interrupted mid-message Position saved; resumes on next tap
-Two hangouts active in the same room Both show in strip; both in list; both counted in header badge
+Two sessions active in the same room Both show in strip; both in list; both counted in header badge
 
 ---
 
 22. Plugin Inventory
 
 Plugin Options Purpose
+extension-plugin extensions Atoll extension system. Registers, validates, mounts extensions. From @atoll/extend.
 state-plugin initialState Global keyed pub/sub
 router-plugin — History API + query-param routing
 socket-plugin socketUrl, apiBase, appKey WebSocket connection
@@ -2648,25 +2263,27 @@ crypto-plugin wasmPath, thresholds MLS wrapper
 oprf-plugin apiBase OPRF blinding + token derivation
 media-plugin presets, workerPoolSize Transcode, thumbnail, strip
 transcription-plugin STT models config Local speech-to-text
-speech-plugin TTS models config Local text-to-speech (Supertonic)
+speech-plugin TTS models config Local text-to-speech
 push-plugin vapidKey, apnsConfig, fcmConfig Push registration
 storage-plugin dbName, blobRoot SQLite + blob filesystem
 i18n-plugin locales, defaultLocale Translation
 theme-plugin presets, accent Theme application
 call-plugin iceServers, transport Call state machine
-hangout-plugin iceServers, heartbeatInterval Hangout state + signaling
+session-plugin iceServers, heartbeatInterval Session state + signaling
 p2p-plugin iceServers, chunkSize WebRTC data channels
 icon-plugin styleMap, registry Solar icon resolution
 notification-plugin defaultSound In-app banners
 search-plugin threshold, debounceMs Fuse.js lifecycle
 
-No event bus. Cross-component communication uses emit and $state key subscriptions.
+No event bus. Cross-component communication uses emit and $state key subscriptions. Cross-extension communication uses publicEvents (§26.7).
 
 ---
 
 23. Appendices
 
 23.1 SQLite Schema
+
+Domain tables:
 
 Domain Tables
 Meta _migrations, _meta (includes last_user_seq, oprf_token_cache_key)
@@ -2676,7 +2293,8 @@ Messages messages, message_versions, reactions
 Attachments attachments
 User state read_state, drafts, outbox, blocked_users, room_preferences, device_names, starred_items
 Personalization wallpapers, sticker_packs, custom_stickers, blocked_sticker_packs, nicknames
-Hangouts hangouts (metadata cache)
+Sessions sessions (metadata cache only; occupancy is not persisted)
+Extension state extension_storage (namespaced by extension_id), extension_preferences (local mirror)
 Speech speech_voices
 Transcription transcription_modes
 Calls calls, call_participants
@@ -2684,7 +2302,7 @@ Sync sync_state (per-room epoch/seq), processed_events
 MLS mls_rooms
 Settings settings
 
-Key new tables:
+Key tables:
 
 ```sql
 CREATE TABLE starred_items (
@@ -2708,15 +2326,18 @@ CREATE TABLE nicknames (
     PRIMARY KEY (room_id, user_id)
 );
 
-CREATE TABLE hangouts (
-    hangout_id    TEXT PRIMARY KEY,
+CREATE TABLE sessions (
+    session_id    TEXT PRIMARY KEY,
     room_id       TEXT NOT NULL,
-    metadata_blob BLOB,               -- decrypted
+    extension_id  TEXT NOT NULL,
+    session_type  TEXT NOT NULL,
+    metadata_blob BLOB,
     position      INTEGER NOT NULL,
     updated_at    INTEGER NOT NULL
 );
 
-CREATE INDEX idx_hangouts_room ON hangouts(room_id, position);
+CREATE INDEX idx_sessions_room ON sessions(room_id, position);
+CREATE INDEX idx_sessions_extension ON sessions(room_id, extension_id, session_type);
 
 CREATE TABLE speech_voices (
     voice_id      TEXT PRIMARY KEY,
@@ -2733,6 +2354,25 @@ CREATE TABLE transcription_modes (
     languages     TEXT NOT NULL,
     downloaded_at INTEGER
 );
+
+CREATE TABLE extension_storage (
+    extension_id  TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    value_blob    BLOB NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (extension_id, key)
+);
+
+CREATE INDEX idx_extension_storage_ext ON extension_storage(extension_id);
+
+CREATE TABLE extension_preferences (
+    extension_id  TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    value_json    TEXT NOT NULL,
+    user_seq      INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (extension_id, key)
+);
 ```
 
 Meta keys:
@@ -2740,6 +2380,7 @@ Meta keys:
 · _meta.last_user_seq — user-scoped sync cursor
 · _meta.read_aloud_settings — JSON { mode, voice, speed, auto_read }
 · _meta.read_aloud_room_overrides — JSON { [roomId]: 'on' | 'off' }
+· _meta.extension_origins — JSON { [extensionId]: { [origin]: 'allowed' | 'denied' } }
 
 Principles: Flat columns for queryable fields; JSON blobs for opaque metadata. IDs TEXT. Timestamps INTEGER ms. Encrypted payloads BLOB. WAL mode. Forward-only migrations.
 
@@ -2747,13 +2388,21 @@ Principles: Flat columns for queryable fields; JSON blobs for opaque metadata. I
 
 Full token list in src/styles/tokens.css. Structure:
 
-· Primitives (neutral, accent, semantic)
+· Primitives (neutral, accent, accent-warm, semantic)
 · Spacing (4px base)
 · Typography
 · Radii, shadows, motion
 · Z-index, layout metrics, safe areas
 
-Dark mode swaps the semantic layer under [data-theme="dark"].
+Semantic tokens remap under [data-theme="dark"]:
+
+· --surface-0 through --surface-3
+· --text-primary, --text-muted
+· --bubble-incoming, --bubble-outgoing
+· --accent-* (brightened in dark mode)
+· --border-*, --divider
+
+Extensions reference only semantic tokens. Ramp tokens are internal to the token file.
 
 23.3 Event Catalog
 
@@ -2771,10 +2420,10 @@ mls.add_pending { room_id, target_user_id, client_ids }
 read.count { room_id, message_id, read_by_count }
 reaction.added { room_id, message_id, user_id, emoji }
 reaction.removed { room_id, message_id, user_id, emoji }
-hangout.created { room_id, hangout_id, created_by, created_at }
-hangout.updated { room_id, hangout_id, metadata?, position? }
-hangout.deleted { room_id, hangout_id }
-hangout.occupancy { room_id, hangout_id, participant_count } (count only)
+session.created { room_id, session_id, extension_id, session_type, created_by, created_at }
+session.updated { room_id, session_id, metadata?, position? }
+session.deleted { room_id, session_id, extension_id }
+session.occupancy { room_id, session_id, participant_count } (count only)
 
 User channel (private-user-{user_id}):
 
@@ -2791,9 +2440,9 @@ mls.welcome_ready { room_id, welcome_id } No
 room.transfer_initiated { room_id, from_user_id, transfer_id } Yes
 room.transfer_cancelled { room_id, transfer_id, reason } Yes
 starred_item.added { item_id, item_type, room_id, user_seq } Yes
-starred_item.removed { item_id, user_seq } Yes
-preference.updated { key, user_seq } (value not in event) Yes
-hangout.signal { room_id, hangout_id, sender_user_id, target_client_id?, signal_type, payload } No
+starred_item.removed { item_id, item_type, user_seq } Yes
+preference.updated { key, user_seq } Yes
+session.signal { room_id, session_id, sender_user_id, sender_client_id, target_client_id?, signal_type, payload } No
 
 Client events (Sockudo-published, ephemeral):
 
@@ -2804,17 +2453,9 @@ client-mls-request { room_id } Prompt pending MLS add
 
 Read state writes go through REST (POST /users/me/read-state), not client events.
 
-23.4 Client Events
+23.4 Server Assumptions
 
-See table above. No event bus; in-app events use emit.
-
-23.5 Error Copy Reference
-
-Consolidated error strings, grouped by layer.
-
-23.6 Server Assumptions
-
-The client implements against Server Specification v2.0 and its amendments (25–29). Blocking items: OPRF, encrypted display names, user-scoped sync, pending_mls_adds, recovery flow, key transparency, call signaling, message editing/reactions/threading, hangouts, model hosting (STT+TTS), starred items, generic preferences.
+The client implements against Server Specification v2.0 and its amendments (25–38). Blocking items: OPRF, encrypted display names, user-scoped sync, pending_mls_adds, recovery flow, key transparency, call signaling, message editing/reactions/threading, sessions, model hosting (STT+TTS), starred items, generic preferences, extension proxy.
 
 Breaking-change coordination: OPRF + user-scoped sync + device model changes ship as one release. No partial rollout.
 
@@ -2822,7 +2463,7 @@ Breaking-change coordination: OPRF + user-scoped sync + device model changes shi
 
 24. Design Decisions Log
 
-This section records significant decisions made during the drafting of Client Specification v1.0. It is not a version history; no prior version exists.
+Significant decisions made during drafting.
 
 # Date Decision
 1 2026-09-29 OPRF-based username lookup. Encrypted display names.
@@ -2835,7 +2476,7 @@ This section records significant decisions made during the drafting of Client Sp
 8 2026-09-30 Link detail view defined. "View in chat" replaces "Jump to chat." Document detail view defined.
 9 2026-09-30 List-detail navigation (horizontal swipe on mobile, hover arrows on desktop).
 10 2026-09-30 Room settings: disclosure sections, icon-circle rows, E2EE badge, X on mobile.
-11 2026-09-30 Header consolidation: video icon removed, headphones icon added for hangouts.
+11 2026-09-30 Header consolidation: video icon removed, headphones icon added for sessions.
 12 2026-09-30 Read-aloud (TTS) with Supertonic. Composer toggle, sentence-level control, auto-resume.
 13 2026-09-30 Inline audio player with transcribe button (two zones). User-facing mode labels.
 14 2026-09-30 Bad transcript detection with suggestion UI.
@@ -2844,6 +2485,17 @@ This section records significant decisions made during the drafting of Client Sp
 17 2026-09-30 Nicknames synced via user preferences (server Amendment 28).
 18 2026-09-30 Read-aloud settings synced via user preferences (server Amendment 28).
 19 2026-09-30 TTS model hosting added to capabilities (server Amendment 26).
+20 2026-10-02 Accent palette locked: Lagoon Blue #2FB6AA, Dark Aquamarine #297370, Coral Reef #EC7562, Papaya Whip #F9F1E4, Beige Skin #E0C0A9. OKLCH luminance inversion for dark mode. 4-step tonal elevation surfaces. Semantic tokens remap under [data-theme="dark"].
+21 2026-10-02 Extension system adopted. Rail/list/detail surfaces. Panel and overlay presentation. Chrome is fixed, content is free. Core extensions use the same API as third-party. defineExtension in @atoll/extend, not Coralite. Monorepo. Components are ambient.
+22 2026-10-02 URL scheme changed from ?view= to ?rail=&detail=&id=. Route ownership resolves through the extension registry. Browser history is the back stack.
+23 2026-10-02 Sessions replace hangouts (server Amendment 35). Extension-owned session types. Server is signaling relay with in-memory occupancy.
+24 2026-10-02 Extension proxy adopted (server Amendment 38). Single ctx.fetch with transport: 'proxy' \| 'direct' \| 'auto'. Default proxy. Auth headers force direct.
+25 2026-10-02 Extension state namespacing. ctx.state writable and namespaced. $state read-only. Extension storage encrypted at rest with device-scoped key.
+26 2026-10-02 Public events. Extensions declare publicEvents with schemas. Emits validated against declared schemas at build time.
+27 2026-10-02 Slots system. Declared on host, mounted on filler. Surface-scoped names. Build-time validated.
+28 2026-10-02 Localization via plugin context. t available in getters and client(), never in templates. Locale files declared in manifest, bridged into Coralite assets by extension-plugin.
+29 2026-10-02 Extension assets declared in manifest, namespaced under assets/extensions/<id>/, resolved via ctx.asset().
+30 2026-10-02 Build-time validation via plugin hooks. Not a parallel subsystem. Errors surface through Coralite's existing channel.
 
 ---
 
@@ -2853,3 +2505,686 @@ This is the contract for the client side of the system. Every client implementat
 
 Design decisions are tracked in §24.
 
+---
+
+26. Extension System
+
+26.1 Overview and Boundary
+
+Extensions are an Atoll Chat concept, not a Coralite concept. defineExtension is exported from @atoll/extend and produces a Coralite plugin internally. Extension authors work entirely in Atoll's vocabulary — rail, list, detail, surfaces, slots, ctx — and never interact with Coralite's plugin API directly.
+
+Coralite does not depend on Atoll. Atoll depends on Coralite. Every extension is a Coralite plugin from Coralite's point of view; it is an extension from Atoll's point of view.
+
+Extensions are client-only. They extend the UI. Server capabilities are added to the server spec, and any client — including extensions — can use them. An extension cannot add server behavior. Extensions that need to fetch data do so through ctx.fetch or through server endpoints exposed to all clients.
+
+Core extensions use the identical API. There is no privileged path. Core extensions are declared with the same defineExtension call, loaded through the same plugin array, validated by the same rules, and mounted by the same shell code. The distinction between core and third-party is a naming convention (core.* vs. com.example.*) and nothing more.
+
+26.2 defineExtension
+
+defineExtension(ext) validates the extension object, applies defaults, normalizes it into the internal shape, registers components, and returns a Coralite plugin.
+
+```js
+// packages/app/src/extensions/chat/index.js
+import { defineExtension } from '@atoll/extend'
+
+export default defineExtension({
+  id: 'core.chat',
+  // ...the declarative shape
+})
+```
+
+The returned plugin is added to the app's plugin array alongside everything else. From Coralite's perspective, it is a normal plugin.
+
+From the author's perspective, defineExtension is the only API surface they touch. definePlugin, defineComponent, and Coralite's lifecycle hooks are all implementation details of Atoll.
+
+26.3 The Extension Object
+
+Complete schema. Fields marked required must be present.
+
+```js
+{
+  id: string,                    // required — 'core.chat', 'com.example.rss'
+  apiVersion: string,            // required — e.g. '1.0.0'
+  hostApi: string,               // required — semver range, e.g. '^1.0'
+  label: string,                 // required for rail-bearing extensions
+  permissions: Permission[],     // optional — declared capabilities
+
+  rail: RailSlot | null,         // optional — panel 1 slot
+
+  list: ListSurface | null,      // required for list-detail extensions
+  detail: DetailSurface,         // required — every extension has one
+
+  slots: SlotMount[],            // optional — slots this extension fills
+  emits: EventDeclaration[],     // optional — events this extension emits
+  publicEvents: EventDeclaration[], // optional — events this extension accepts
+  listens: EventListener[],      // optional — declared listeners
+
+  sessions: SessionTypeDecl[],   // optional — session types this extension owns
+  preferences: PreferenceDecl[], // optional — cross-device preference keys
+
+  locales: LocaleDecl | null,    // optional — translations
+  assets: AssetDecl[],           // optional — static files
+
+  onRegister: (ctx) => void,     // optional — one-time setup
+  onActivate: (ctx) => void,     // optional — becomes active rail
+  onDeactivate: (ctx) => void    // optional — no longer active rail
+}
+```
+
+Normative statement: An extension declares only its public surface. Private state, internal components, and implementation details are not part of the extension object and are not visible to other extensions.
+
+RailSlot:
+
+```js
+{
+  icon: { name: string, state?: string },
+  order: number,
+  badge: { deps: string[], compute: (ctx) => number | 'dot' | null } | null,
+  visible: (ctx) => boolean,
+  mobile: { placement: 'bottom' | 'more' | 'hidden', order?: number }
+}
+```
+
+ListSurface:
+
+```js
+{
+  route: string,
+  title: string | (ctx) => string,
+  component: string,
+  actions: ActionDescriptor[],
+  slots: Record<string, SlotDeclaration>,
+  empty: EmptyDecl | null,
+  loading: LoadingDecl | null,
+  error: ErrorDecl | null
+}
+```
+
+DetailSurface:
+
+```js
+{
+  route: string,
+  title: string | (ctx) => string,
+  component: string,
+  actions: ActionDescriptor[],
+  slots: Record<string, SlotDeclaration>,
+  surfaces: ('panel' | 'overlay')[],
+  defaultSurface: 'panel' | 'overlay',
+  back: 'auto' | true | false,
+  scope: Record<string, string>,
+  settings: SettingsDecl | null,
+  empty: EmptyDecl | null,
+  loading: LoadingDecl | null,
+  error: ErrorDecl | null
+}
+```
+
+ActionDescriptor:
+
+```js
+{
+  id: string,
+  icon: string,                          // Solar icon name
+  label: string,
+  onSelect: (ctx) => void,
+  visible: (ctx) => boolean,
+  disabled: (ctx) => boolean,
+  active: (ctx) => boolean,
+  badge: (ctx) => number | 'dot' | null,
+  variant: 'default' | 'danger',
+  placement: { desktop?: 'inline' | 'overflow', mobile?: 'inline' | 'overflow' }
+}
+```
+
+SlotDeclaration (on host):
+
+```js
+{ multiple: boolean, order: 'ascending' | 'descending' | 'fixed' }
+```
+
+SlotMount (on filler):
+
+```js
+{
+  slot: string,                 // fully-qualified slot name
+  component: string,
+  order: number,
+  visible: (ctx) => boolean
+}
+```
+
+EventDeclaration (both emits and publicEvents):
+
+```js
+{
+  event: string,                // e.g. 'media:open'
+  schema: Record<string, string>  // flat key → type
+}
+```
+
+Types: 'string', 'number', 'boolean', 'string?' (optional), 'a|b|c' (enum). No nested objects.
+
+EventListener:
+
+```js
+{
+  event: string,
+  handler: (detail, ctx) => void
+}
+```
+
+SessionTypeDecl:
+
+```js
+{
+  type: string,
+  maxParticipants: number,
+  maxPerRoom: number,
+  heartbeatInterval: number,
+  metadata: Record<string, string>,     // schema, client-side only
+  signaling: Record<string, Record<string, string>>  // schema, client-side only
+}
+```
+
+PreferenceDecl:
+
+```js
+{ key: string, type: 'string' | 'number' | 'boolean' | 'object' | 'array', label: string }
+```
+
+LocaleDecl:
+
+```js
+{
+  default: string,
+  files: Record<string, string>  // locale → path
+}
+```
+
+AssetDecl:
+
+```js
+{ src: string, dest: string }
+```
+
+EmptyDecl, LoadingDecl, ErrorDecl:
+
+```js
+// Empty: either declarative or custom component
+{ icon?: string, title: string, body?: string, action?: ActionDescriptor }
+// or
+{ component: string }
+
+// Loading: preset variant or custom component
+{ variant: 'list' | 'grid' | 'thread' | 'detail' }
+// or
+{ component: string }
+
+// Error: retry flag or custom component
+{ retry: boolean }
+// or
+{ component: string }
+```
+
+SettingsDecl:
+
+```js
+{
+  title: string,
+  component: string,
+  sections?: SettingsSectionDecl[]
+}
+```
+
+26.4 Context (ctx)
+
+ctx is the extension's view of the shell. It is passed to every callback the extension declares — title, onSelect, visible, compute, listens[].handler, and lifecycle hooks.
+
+Shape:
+
+```ts
+interface ExtensionCtx {
+  // identity
+  id: string
+
+  // global, read-only
+  $state: Readonly<GlobalState>
+  capabilities: Capabilities
+  platform: 'mobile' | 'tablet' | 'desktop'
+
+  // own state, namespaced, writable
+  state: Record<string, unknown>
+  storage: {
+    get<T>(key: string): Promise<T | undefined>
+    set<T>(key: string, value: T): Promise<void>
+    delete(key: string): Promise<void>
+    clear(): Promise<void>
+  }
+  preferences: {
+    get<T>(key: string): Promise<T | undefined>
+    set<T>(key: string, value: T): Promise<void>
+    delete(key: string): Promise<void>
+    subscribe<T>(key: string, cb: (value: T) => void): () => void
+  }
+
+  // surface context — null when the invocation isn't surface-bound
+  surface: 'list' | 'detail' | null
+  scope: Record<string, unknown> | null
+  selection: { id: string; type: string } | null
+  position: { index: number; total: number } | null
+
+  // navigation — only this extension's routes and surfaces
+  navigate(route: string, params?: object): void
+  back(): void
+  present(opts: PresentOptions): void
+  dismiss(): void
+
+  // shell utilities
+  toast(message: string, opts?: ToastOptions): void
+  notify(message: string, opts?: NotifyOptions): void
+  openExternal(url: string): void
+  asset(path: string): string
+  hasPermission(permission: string): boolean
+
+  // network
+  fetch(url: string, opts?: FetchOptions): Promise<Response>
+  fetchUserUrl(url: string, opts?: FetchOptions): Promise<Response>
+
+  // localization
+  t(key: string, vars?: Record<string, string | number>): string
+
+  // lifecycle
+  signal: AbortSignal
+}
+```
+
+What's populated at each invocation point:
+
+Invocation surface scope selection position
+badge.compute null null null null
+slots[].visible host's host's host's host's
+title (list) 'list' extension's null null
+title (detail) 'detail' extension's set set
+actions[].onSelect surface extension's set set
+empty.action.onSelect surface extension's null null
+listens[].handler null null null null
+onRegister null null null null
+onActivate null activation scope null null
+onDeactivate null activation scope null null
+
+Normative statements:
+
+· ctx.$state is read-only. ctx.state is the extension's writable slice. Extensions cannot write to another extension's state, and cannot write to the shell's state.
+· ctx is reconstructed per invocation. It is not a stable identity and should not be stored.
+· ctx.navigate, ctx.present, and ctx.dismiss are extension-scoped. ctx.navigate('chat') from core.media fails — chat isn't media's route. ctx.dismiss() only closes the extension's own overlay.
+
+PresentOptions:
+
+```ts
+{
+  scope?: Record<string, unknown>,
+  selection?: string,
+  surface?: 'overlay'
+}
+```
+
+FetchOptions:
+
+```ts
+{
+  method?: 'GET' | 'POST' | 'HEAD',
+  headers?: Record<string, string>,
+  body?: string | Uint8Array,
+  transport?: 'proxy' | 'direct' | 'auto',
+  signal?: AbortSignal
+}
+```
+
+26.5 Surfaces and Routes
+
+Rail, list, detail. Three surfaces, mapped to the three panels of the desktop layout.
+
+· Rail — the icon strip in Panel 1. Optional. Every rail-bearing extension appears in the strip, sorted by rail.order.
+· List — the list surface in Panel 2. Required for list-detail extensions.
+· Detail — the detail surface in Panel 3. Required for every extension.
+
+Presentation. A detail surface is presented in one of two ways:
+
+· panel — inline in Panel 3. Changes the rail context when the detail belongs to a different extension than the current rail.
+· overlay — modal above the content area. Does not change the rail. Rail highlight remains where the user was.
+
+An extension declares which surfaces it admits in detail.surfaces. The router chooses defaultSurface when resolving from a URL or a rail click. A caller can request a different admitted surface via ctx.present({ surface }).
+
+Route ownership. Every route is owned by exactly one extension. extensions.ownerOfRoute(route) resolves it. Duplicate route names are a build error.
+
+Normative statements:
+
+· Every surface has a required title. The shell draws the header, actions, and overlay chrome. Extensions supply content.
+· An overlay does not change the rail. A panel does.
+· Overlay stacking: one per extension, LIFO. Escape, X, click-outside, ctx.dismiss(), and the back button all route through history.back().
+· Back button behavior: pops the history stack. If the stack is empty, back goes to the owning extension's list, or the rail default if the extension has no list.
+
+Chrome vs. content. The following are chrome — drawn by the shell, identical everywhere, not touched by extensions:
+
+· Header (back arrow or X, title, actions row)
+· Overlay frame (drawer / sheet / full-screen modal)
+· Settings frame
+· Rail icons and badges
+· Mobile bottom nav and overflow sheet
+
+The following are content — drawn by extensions inside the content area:
+
+· List body
+· Detail body
+· Search fields and filters
+· Empty, loading, and error states (unless declared declaratively)
+
+26.6 Slots
+
+A slot is a named insertion point in a surface. The host extension declares its slots; other extensions mount components into them.
+
+Declaration (host side):
+
+```js
+detail: {
+  route: 'chat',
+  title: (ctx) => ctx.room?.name,
+  component: 'view-chat',
+  slots: {
+    'aboveThread':         { multiple: true, order: 'ascending' },
+    'composer.above':      { multiple: true },
+    'composer.attachMenu': { multiple: true },
+    'composer.leading':    { multiple: false },
+    'composer.trailing':   { multiple: false }
+  }
+}
+```
+
+Mount (filler side):
+
+```js
+slots: [
+  {
+    slot: 'chat.composer.attachMenu',
+    component: 'x-bookmarks-attach-action',
+    order: 50,
+    visible: (ctx) => ctx.$state.selectedRoomId !== null
+  }
+]
+```
+
+Normative statements:
+
+· Slot names are surface-scoped strings: <extensionShortId>.<slotName>. They are not globally registered.
+· Slot names are string literals. Build-time validation confirms every mounted slot resolves to a declared slot on a registered extension.
+· If a slot declares multiple: false and more than one extension mounts it, the build fails.
+· A slot host's visible receives the host's surface context, not the filler's.
+
+26.7 Events
+
+Three event mechanisms:
+
+1. emits — events this extension broadcasts. Declared with schemas.
+2. publicEvents — events this extension accepts from other extensions. Declared with schemas.
+3. listens — handlers for public events. Declared with handlers.
+
+Declaration:
+
+```js
+// core.chat declares public events it accepts
+publicEvents: [
+  { event: 'chat:compose', schema: {
+      roomId: 'string',
+      text: 'string',
+      previewTitle: 'string?',
+      previewDescription: 'string?'
+    }
+  }
+],
+
+// RSS emits chat:compose
+emits: [
+  { event: 'chat:compose', schema: {
+      roomId: 'string',
+      text: 'string',
+      previewTitle: 'string?',
+      previewDescription: 'string?'
+    }
+  }
+]
+```
+
+Normative statements:
+
+· Event schemas are flat objects. Types are string, number, boolean, string? (optional), or a |-separated enum. No nested objects. If an event needs nested data, it should be two events.
+· Every emit call is validated against the declared schema at build time. Every detail.xyz access in a listener is validated against the schema of the event being listened to.
+· Emitter and receiver schemas must match. Two extensions cannot declare different schemas for the same event name.
+· An event declared in emits must either be the extension's own event (broadcast to listeners) or match a publicEvents declaration on another extension. Build-time validation checks this.
+· Event ordering: registration order. Both handlers fire. No stopPropagation. No priority.
+
+Common public events:
+
+core.chat:
+
+Event Schema
+chat:compose { roomId, text, previewTitle?, previewDescription? }
+chat:insert-text { roomId, text, position: 'start'\|'end'\|'cursor' }
+chat:focus { roomId }
+chat:set-draft { roomId, text }
+chat:message-sent (emitted) { roomId, messageId, text }
+
+core.media:
+
+Event Schema
+media:open { roomId, attachmentId, surface: 'panel'\|'overlay' }
+
+26.8 Sessions
+
+An extension declares the session types it owns:
+
+```js
+sessions: [
+  {
+    type: 'voice',
+    maxParticipants: 12,
+    maxPerRoom: 3,
+    heartbeatInterval: 15,
+    metadata: { name: 'string', icon_file_id: 'string?', description: 'string?' },
+    signaling: {
+      offer: { sdp: 'string' },
+      answer: { sdp: 'string' },
+      ice: { candidate: 'string' }
+    }
+  }
+]
+```
+
+Normative statements:
+
+· Session types are declared with the extension. Duplicate (extension_id, type) pairs across extensions are a build error.
+· The server validates session type against its own SESSION_TYPES.toml configuration. The client's declaration is used for vocabulary, build-time validation, and emitting a recommended configuration to operators via atoll-chat build --emit-session-types.
+· Metadata and signaling schemas are client-side only. The server never validates them. They exist so the extension's own code and its peers agree on the shape.
+
+26.9 Preferences
+
+Cross-device key/value store. Wraps the generic preferences endpoint (Server Spec Amendment 28).
+
+Declaration:
+
+```js
+preferences: [
+  { key: 'feedList', type: 'object', label: 'Subscribed feeds' },
+  { key: 'readIds',  type: 'array',  label: 'Read articles' },
+  { key: 'lastRefresh', type: 'number' }
+]
+```
+
+Normative statements:
+
+· Every preference key must be declared. Keys not declared are rejected at build time.
+· The host prefixes every key with ext:{extensionId}: before sending to the server.
+· Values are capped at 64 KB. Exceeding the cap is a runtime error with a clear message.
+· Reserved keys (room_order) and prefixes (_system:) cannot be claimed.
+· Values are not end-to-end encrypted. Extensions that store sensitive data should encrypt before setting.
+· Sync is automatic. preferences.subscribe(key, cb) routes preference.updated events.
+
+26.10 Storage
+
+Encrypted local store. Device-scoped.
+
+Normative statements:
+
+· ctx.storage is encrypted at rest with a device-scoped key. Same treatment as the app's own sensitive state.
+· Namespaced by extension id. Two extensions cannot read each other's storage.
+· Cleared on "Log out and clear data," not on regular logout.
+· Per-extension quota: 5 MB default, operator-configurable.
+· ctx.state is memory. ctx.storage is disk. Extensions choose.
+
+State lifecycle:
+
+· ctx.state is in-memory. It persists for the session but not across reloads.
+· On deactivate, state is preserved. Returning to the extension restores its state.
+· Extensions that need across-reload persistence use ctx.storage.
+
+26.11 Fetch
+
+Single method with transport option.
+
+Normative statements:
+
+· The default transport is 'proxy'. It hides the user's IP and works around CORS.
+· Extensions that send Authorization headers must use 'direct' and accept the IP exposure. Passing 'proxy' with an auth header is a build error.
+· 'auto' uses proxy unless the request contains Authorization, in which case it uses direct.
+· If extension_proxy_enabled is false, 'proxy' fails and 'auto' falls back to direct with a user-visible notice.
+· Every user-entered origin requires explicit user approval, stored in _system:extension_origins:{extensionId} (host-managed, not extension-writable).
+· Origins declared in the manifest are advisory. They feed the consent screen and code review, not runtime enforcement.
+
+Response handling:
+
+· content-length may be absent or unreliable. Use the decrypted body length.
+· 502 upstream_response_too_large — extension retries with transport: 'direct' and shows a one-time "bypassed proxy" toast.
+· 429 rate_limited — surface Retry-After and bucket ('extension' or 'user_total') to the user.
+
+Streaming: Not supported through the proxy. Extensions that need streaming (SSE, WebSocket) use transport: 'direct'. The manifest declares streaming: true on the permission, and the build-time validator rejects transport: 'proxy' for those origins.
+
+26.12 Lifecycle
+
+onRegister(ctx) — runs once when the extension is loaded. Setup work. Hydrate from storage. Fetch preferences. Not called for every activation.
+
+onActivate(ctx) — runs when the extension becomes the active rail context. Rail click, deep link, or ctx.navigate() to this extension's route.
+
+onDeactivate(ctx) — runs when the extension is no longer the active rail context. Rail switch, deep link to another extension, or navigation away.
+
+Normative statements:
+
+· onActivate and onDeactivate do not fire on internal navigation (list → detail within the same extension).
+· Overlays from other extensions do not fire these hooks. The active rail context is unchanged.
+· All subscriptions and timers created in onActivate should be cleaned up on onDeactivate or via ctx.signal.
+· ctx.signal aborts on onDeactivate.
+
+26.13 Build-Time Validation
+
+Validation runs inside defineExtension's plugin hooks. It is not a separate subsystem. Errors surface through Coralite's existing build error channel.
+
+Phase 1 — Registration. Runs as each extension is loaded.
+
+Checks: required fields, id format and uniqueness, rail shape, list/detail routes, surfaces values, settings shape, actions[] shape, icon names against Solar registry, component tags against registered components, slots declaration shape, slots[].slot mount shape, emits/publicEvents/listens format, mobile.panel1.placement values, apiVersion and hostApi semver, permissions allowlist, state key collisions with shell-reserved keys, preferences key patterns.
+
+Phase 2 — Link. Runs after all extensions registered.
+
+Checks: route uniqueness, reserved routes, slot resolution (every mounted slot resolves to a declared slot), slot multiplicity, listener/emitter match (every listens names an event declared in some emits or publicEvents), event schema match between emitter and receiver, circular slot mounts, rail order collisions (warning), scope key consistency (warning), duplicate action icons in overflow (warning).
+
+Error format: Each error includes location (file and line), object path, context (what's actually available), and a suggestion.
+
+Normative statements:
+
+· Validation is mandatory. There is no --skip-validation flag. An extension that fails validation does not build.
+· Runtime guards exist as a backstop for dynamic cases (dynamic routes, dynamic origins). Build-time validation is the primary mechanism.
+· Accessibility is not checked by the extension validator. It is checked by Coralite's component validator (CORALITE-E105, accessible-name rules) and by Playwright + @axe-core/playwright in each extension's test suite.
+
+26.14 Naming Conventions
+
+Extension IDs:
+
+· core.<name> — first-party extensions. Reserved.
+· com.example.<name> — third-party extensions. Reverse-DNS.
+· IDs are unique. Duplicates are a build error.
+
+Component tags:
+
+· First-party extensions use existing conventions: ui-*, chat-*, message-*, view-*, session-*.
+· Third-party extensions must prefix: x-<slug>-<component>. Slug is derived from the extension id.
+· The validator rejects component tags that don't match the convention.
+
+Routes:
+
+· Reserved routes: index, 404. Extension routes must not collide.
+· Extension routes are short, lowercase, hyphen-separated.
+
+Slots:
+
+· Surface-scoped: <hostExtensionShortId>.<slotName>. The short ID is the last segment of the extension id (core.chat → chat).
+· Slot names are camelCase.
+
+Events:
+
+· Namespaced: <source>:<event> (e.g., media:open, chat:compose).
+· The namespace is the source extension's short ID.
+
+Preference keys:
+
+· camelCase, lowercase first letter.
+· Reserved prefixes: _system:. Reserved keys: room_order.
+
+26.15 Vocabulary Command
+
+```
+atoll-chat extensions vocab [--json] [--section <name>]
+```
+
+Runs offline. Reads the extension registry from the app's build output. Emits the complete author-facing vocabulary: components, slots, public events, routes, session types, reserved keys, icons, platforms, surfaces.
+
+--json emits machine-readable output. Without it, human-readable summary. --section filters to one section.
+
+Sections: components, slots, events, routes, sessions, preferences, permissions, icons, platforms, surfaces, reserved.
+
+Normative statements:
+
+· The vocabulary command exposes only the author-facing surface. Private state, internal components, and implementation details are not included. Exposing private surface is a breaking change to the extension API.
+· The vocabulary is the contract. If a name appears in the vocabulary, extensions can depend on it. If it doesn't, they cannot.
+· The human-readable form is regenerated as an appendix to this specification after every non-patch release.
+
+---
+
+Appendix A — Registered Components
+
+Generated from the registry. Regenerated via atoll-chat extensions vocab. Lists every component tag available to extension templates, with summary, attributes, and slots.
+
+Appendix B — Reserved Keys, Routes, and Slots
+
+Category Reserved
+Preference keys room_order
+Preference prefixes _system:
+Routes index, 404
+Slots (none reserved — all slot names are host-declared)
+
+Appendix C — Core Extensions
+
+Extension ID Rail Routes Session types Notes
+core.chat ✅ chats, chat, room-settings — Owns the message thread, composer, and room settings overlay
+core.media ✅ media, media-viewer — Owns the media grid and viewer
+core.documents ✅ documents, document — Owns document list and detail
+core.links ✅ links, link — Owns link list and detail
+core.calls ✅ calls, call — Owns call history and in-call UI
+core.settings ✅ settings, settings-section — Owns all settings sections
+core.hangouts — sessions, session voice Owns voice sessions
+core.profile — profile — User profile view
+core.join — join — Invite confirmation
+core.admin — admin — Gated on capabilities.admin
+
+Core extensions use the same API as third-party extensions. The only differences are the ID prefix (core.*) and the fact that they ship with the app.
+
+---
+
+End of Client Specification v1.0.
