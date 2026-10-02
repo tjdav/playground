@@ -29,13 +29,14 @@ Bot protection ALTCHA Proof-of-Work v2 via altcha 0.2.0
 Attachment encryption C2SP chunked encryption (c2sp.org/chunked-encryption)
 Static SPA hosting Axum ServeDir with SPA fallback
 Model hosting Instance-local, external shared origin, or proxy-with-cache
+Extension proxy SSRF-guarded egress gateway for client extensions
 TLS termination External reverse proxy (Traefik via Coolify, or Caddy)
 
 V2 architectural changes:
 
 1. The server no longer stores plaintext usernames, display names, or device names. Identity is anchored in an OPRF token.
 2. User-scoped state (read state, room order, device names, starred items, preferences) is durable and sequence-synced across a user’s devices.
-3. Message editing, reactions, threading, key transparency, link preview proxy, call signaling, sessions, model hosting, starred items, and generic preferences are added.
+3. Message editing, reactions, threading, key transparency, link preview proxy, call signaling, sessions, model hosting, starred items, generic preferences, and an extension proxy are added.
 4. Ambient presence remains refused. Call-scoped co-presence within calls and sessions is permitted and is disclosed only to participants. It is never persisted.
 
 ---
@@ -65,6 +66,7 @@ Everything in V1 §2.1, plus:
 · Call signaling. WebRTC signaling events; TURN credential endpoint.
 · Sessions. Persistent, named, room-scoped real-time spaces with in-memory occupancy. Voice hangouts are one session type; watch-together, games, whiteboards, and other types are supported by the same mechanism.
 · Model hosting. STT and TTS models, with local, external, and proxy hosting modes.
+· Extension proxy. Opt-in, SSRF-guarded egress gateway for client extensions. Blind to URLs, request bodies, response bodies, and credentials.
 · Admin surfaces for new V2 features.
 · Batched test execution model. See §5.30.
 
@@ -101,6 +103,8 @@ Call-scoped co-presence is permitted. Within a call or a session, the server kno
 · Shared SPA hosting across instances. The SPA bundle is version-coupled to the server. Operators may place a CDN in front of CLIENT_STATIC_DIR for the same version, but the spec does not provide a cross-version shared origin.
 · Server-side periodic work. Fetching RSS, polling external APIs, scheduled tasks. These belong to the server spec directly, as discrete endpoints, and are out of scope here.
 · Room events for extension sync without a session. Fire-and-forget broadcasts to room members outside of a session are a future addition. See §16.23 for the forward-looking note.
+· Streaming through the extension proxy. SSE, chunked binary, and multipart streams are not supported through /extensions/proxy. Extensions that need streaming use direct fetch. See §16.26.
+· Extension proxy response caching. No server-side caching of proxied responses.
 
 2.4 Breaking Changes from V1
 
@@ -119,6 +123,7 @@ Key transparency Absent New tables + endpoints.
 Call signaling Absent New events + endpoint.
 Hangouts Absent Renamed to sessions with extension_id and session_type.
 Model hosting Absent New endpoints + three hosting modes.
+Extension proxy Absent New endpoint.
 client-read client event Present Removed. Replaced by POST /users/me/read-state.
 GET /users/me/sync Absent New.
 POST /oprf/blind Absent New.
@@ -217,10 +222,13 @@ Key transparency retention key_transparency_retention_days V2.
 Recovery code consumption Immediate V2. Consumed codes are marked, not deleted, for audit.
 Call state cleanup 24 hours after call end V2. Deletes call_sessions rows and any dangling participants.
 Room session metadata pruning (optional) 90 days of zero occupancy, disabled by default V2. A session is a persistent space. Do not enable without operator intent.
+Extension proxy bandwidth accounting 24 hours V2. The accounting table uses the standard rate-limit table. Pruned by the existing hourly job.
 
 No cleanup job is required for session occupancy. Occupancy is in-memory and self-cleaning. There is nothing to prune.
 
 No cleanup job is required for model files. Models are immutable and content-addressed by version.
+
+No cleanup job is required for the extension proxy. Nothing is persisted beyond the rate-limit table.
 
 ---
 
@@ -241,6 +249,8 @@ CLIENT_STATIC_DIR=/app/client
 Log policy. The server writes structured logs to stdout and stderr only. It does not write log files. Container runtime captures and rotates stdout. The server does not store request logs persistently. No IP addresses, URLs, or user identifiers are written by the server to any persistent store. Retention of stdout is the operator’s responsibility and must be documented in the operator’s privacy policy.
 
 Session occupancy is never logged. Not to stdout, not to stderr, not to any metrics pipeline, not to any tracing system. See §12.
+
+Extension proxy URLs, bodies, and responses are never logged. Not to stdout, not to stderr, not to any metrics pipeline. See §12.
 
 SPA deployment note. Operators with multiple instances of the same server version MAY place a CDN in front of CLIENT_STATIC_DIR to reduce bandwidth. This is a deployment choice, not a server feature. The SPA bundle is version-coupled to the server; do not serve an SPA bundle from a different version than the server behind it.
 
@@ -348,6 +358,8 @@ SessionJoin session_join:{user_id}:min:{boundary} Per minute
 SessionHeartbeat session_heartbeat:{user_id}:{session_id}:min:{boundary} Per minute
 SessionSignal session_signal:{user_id}:{session_id}:min:{boundary} Per minute
 ModelDownload model_download:{ip}:min:{boundary} Per minute
+ExtensionProxy extension_proxy:{user_id}:{extension_id}:{minute\|hour\|day}:{boundary} Per minute, Hourly, Daily
+ExtensionProxyTotal extension_proxy_total:{user_id}:{minute\|hour\|day}:{boundary} Per minute, Hourly, Daily
 
 Rate limit state is stored in a SQLite table and pruned hourly.
 
@@ -560,7 +572,7 @@ Rules:
 · A room can hold at most max_per_room sessions of a given type.
 · extension_id is informational and is echoed into capabilities. The server does not validate or enforce it.
 · Malformed or missing file: sessions are disabled at startup with a clear error, but the server continues running. Other features are unaffected.
-· Reload is atomic. On validation error, the previous config remains in effect, and the admin endpoint returns HTTP 400 with the validation error. See §8.3.
+· Reload is atomic. On validation error, the previous config remains in effect, and the admin endpoint returns HTTP 400 with the validation error. See §8.3.1.
 · No SIGHUP. Reload is triggered only via the admin endpoint. This is portable across containerized deployments.
 
 Client build emission. The client build process may emit a recommended SESSION_TYPES.toml as a build artifact via atoll-chat build --emit-session-types. The emitted file is a suggestion; the server reads only the operator’s copy.
@@ -654,6 +666,62 @@ Contributor rules:
 5. Each batch MUST complete in under 60 seconds. If a batch exceeds this, split it.
 
 Enforcement. The test_batch_manifest test and the make check-batches script both verify the manifest invariant. Both fail on orphan files, phantom entries, or duplicate assignments.
+
+5.31 Extension Proxy
+
+```env
+EXTENSION_PROXY_ENABLED=false
+EXTENSION_PROXY_MAX_REQUESTS_PER_MIN=60
+EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR=500
+EXTENSION_PROXY_MAX_REQUESTS_PER_MIN_TOTAL=120
+EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR_TOTAL=1000
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_HOUR_BYTES=52428800
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_DAY_BYTES=524288000
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_HOUR_BYTES_TOTAL=104857600
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_DAY_BYTES_TOTAL=1073741824
+EXTENSION_PROXY_TIMEOUT_CONNECT_SECONDS=5
+EXTENSION_PROXY_TIMEOUT_READ_SECONDS=30
+EXTENSION_PROXY_MAX_RESPONSE_BYTES=10485760
+EXTENSION_PROXY_MAX_REQUEST_BYTES=262144
+EXTENSION_PROXY_USER_AGENT=Atoll/2.0
+EXTENSION_PROXY_DENY_DOMAINS=
+EXTENSION_PROXY_DENY_DOMAINS_PATH=
+```
+
+Variable Default Scope
+EXTENSION_PROXY_ENABLED false Advertised in capabilities.
+EXTENSION_PROXY_MAX_REQUESTS_PER_MIN 60 Per user, per extension.
+EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR 500 Per user, per extension.
+EXTENSION_PROXY_MAX_REQUESTS_PER_MIN_TOTAL 120 Per user total.
+EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR_TOTAL 1000 Per user total.
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_HOUR_BYTES 52428800 (50 MB) Per user, per extension.
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_DAY_BYTES 524288000 (500 MB) Per user, per extension.
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_HOUR_BYTES_TOTAL 104857600 (100 MB) Per user total.
+EXTENSION_PROXY_MAX_BANDWIDTH_PER_DAY_BYTES_TOTAL 1073741824 (1 GB) Per user total.
+EXTENSION_PROXY_TIMEOUT_CONNECT_SECONDS 5 Connect timeout.
+EXTENSION_PROXY_TIMEOUT_READ_SECONDS 30 Read timeout.
+EXTENSION_PROXY_MAX_RESPONSE_BYTES 10485760 (10 MB) Decompressed response size limit.
+EXTENSION_PROXY_MAX_REQUEST_BYTES 262144 (256 KB) Request body size limit.
+EXTENSION_PROXY_USER_AGENT Atoll/2.0 Forced outbound User-Agent.
+EXTENSION_PROXY_DENY_DOMAINS empty Comma-separated domain suffixes (example.com, abuse.net). Subdomains match.
+EXTENSION_PROXY_DENY_DOMAINS_PATH empty File path, one domain per line.
+
+Default disabled. Same posture as the link preview proxy. Operators opt in.
+
+Two-bucket rate limiting. Per-user-per-extension limits alone are bypassable by rotating extension_id. Both buckets must pass:
+
+· Per user, per extension: extension_proxy:{user_id}:{extension_id}:{minute|hour|day}:{boundary}
+· Per user total: extension_proxy_total:{user_id}:{minute|hour|day}:{boundary}
+
+Bandwidth is counted against both buckets.
+
+Domain blocklist. Checked after decryption, before the request is made. Match is on the host portion of the URL. IP literals are rejected by the SSRF guard before reaching the blocklist. Malformed entries in the config or file are logged as warnings at startup and skipped. They do not cause startup failure.
+
+No operator-configurable allowlist. Rate limits are the primary control. The blocklist is for specific excluded hosts.
+
+5.32–5.34 Reserved
+
+Reserved for future use.
 
 ---
 
@@ -862,6 +930,20 @@ Client responsibility on icon attachments. If a session’s metadata references 
 4. Apply preference.updated events by user_seq; the value is not in the event, so refetch from sync or from GET /users/me/preferences/:key if needed.
 
 Reserved keys. room_order is server-defined and has its own endpoint. Keys starting with _ are reserved. All other keys are client-defined.
+
+6.30 Extension Proxy
+
+1. Fetch extension_proxy_enabled from /capabilities. If false, extensions must use transport: 'direct'.
+2. Fetch the limits: extension_proxy_max_request_bytes, extension_proxy_max_response_bytes, extension_proxy_supports_streaming.
+3. Encrypt the request with a per-request Content Key. Send POST /extensions/proxy.
+4. Decrypt the response with the same Content Key.
+5. Handle 502 upstream_response_too_large by retrying with transport: 'direct' and informing the user that the request bypassed the proxy.
+6. Handle 429 with Retry-After and surface the delay to the extension.
+7. Handle 400 header_not_allowed and 400 header_not_allowed (Authorization/Cookie) by falling back to direct fetch with a user-visible notice.
+
+Content Key mechanism. Identical to the link preview proxy (§8.1.2). No new cryptography.
+
+Non-goals. No streaming through the proxy. Extensions that need streaming use transport: 'direct'.
 
 ---
 
@@ -1240,6 +1322,7 @@ Path Purpose Notes
 In-memory occupancy Call and session participation Never persisted. Lost on restart.
 MODEL_STORAGE_PATH Model files Immutable. Optional in external mode.
 SESSION_TYPES_CONFIG_PATH Session type allowlist Operator-maintained.
+EXTENSION_PROXY_DENY_DOMAINS_PATH Domain blocklist Operator-maintained.
 
 ---
 
@@ -1278,6 +1361,7 @@ POST /invites/redeem Validate and consume server invite
 GET /invites/:code Public invite validation
 POST /oprf/blind OPRF evaluation
 POST /link-preview/proxy Link preview proxy (opt-in)
+POST /extensions/proxy Extension proxy (opt-in, requires auth)
 GET /models/stt/v1/:model_id/:version/:filename STT model files (local/proxy mode only)
 GET /models/tts/v1/:model_id/:version/:filename TTS model files (local/proxy mode only)
 GET /models/manifest.json Model manifest (local/proxy mode only)
@@ -1336,6 +1420,10 @@ GET /capabilities response (V2):
   "oprf_suite": "ristretto255-sha512",
   "key_transparency_enabled": true,
   "link_preview_proxy_enabled": false,
+  "extension_proxy_enabled": false,
+  "extension_proxy_max_request_bytes": 262144,
+  "extension_proxy_max_response_bytes": 10485760,
+  "extension_proxy_supports_streaming": false,
   "safety_number_mode": "warn",
   "moderation_mode": "messenger",
   "edit_window_seconds": 900,
@@ -1357,7 +1445,15 @@ Logging: each request increments an ephemeral counter in oprf_audit. No IP, no t
 
 8.1.2 POST /link-preview/proxy
 
-Unchanged from earlier specification.
+Auth: None. Rate limit: RATE_LINK_PREVIEW_PER_MIN, per IP.
+
+Request: { "encrypted_url": "<base64>", "wrapped_content_key": "<base64, RSA-OAEP(server_pubkey, ContentKey)>", "nonce": "<base64, 12 bytes>" }
+
+Response: { "encrypted_metadata": "<base64>", "nonce": "<base64, 12 bytes>" }
+
+SSRF protection: DNS resolution with private/loopback/link-local/multicast rejection; IP pinning; redirect re-validation; HTTP(S) only; body size cap; timeout; strip all HTML.
+
+Errors: 400 invalid_request, 400 url_blocked, 504 upstream_timeout, 413 response_too_large, 429 rate_limited, 501 link_preview_proxy_disabled.
 
 8.1.3 GET /models/stt/v1/:model_id/:version/:filename and GET /models/tts/v1/:model_id/:version/:filename
 
@@ -1367,18 +1463,67 @@ Behavior: serve static model files with immutable cache headers. In external mod
 
 Headers: Cache-Control: public, max-age=31536000, immutable. Content-Type: application/octet-stream. ETag from file hash. Range requests supported.
 
-Errors:
-
-Error HTTP error field
-Not found 404 model_not_found
-Rate limited 429 rate_limited
-Mode is external 404 model_hosting_external
+Errors: 404 model_not_found, 429 rate_limited, 404 model_hosting_external.
 
 8.1.4 GET /models/manifest.json
 
 Auth: None.
 
 Behavior: return the model manifest. In local and proxy mode, read from STT_MODELS_PATH/manifest.json and TTS_MODELS_PATH/manifest.json and combine. In external mode, this endpoint is not registered.
+
+8.1.5 POST /extensions/proxy
+
+Auth: Required. Authorization: Bearer <session_token>.
+
+Content-Type: application/octet-stream.
+
+Rate limits: EXTENSION_PROXY_MAX_REQUESTS_PER_MIN and EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR (per user, per extension), plus EXTENSION_PROXY_MAX_REQUESTS_PER_MIN_TOTAL and EXTENSION_PROXY_MAX_REQUESTS_PER_HOUR_TOTAL (per user total). Both buckets must pass. Bandwidth is counted against both buckets.
+
+Request: Content Key encryption of a JSON document containing url, method, headers, body, extension_id, request_id.
+
+Request constraints:
+
+Field Constraint
+url HTTPS only. Private IP ranges rejected. Max 2048 chars.
+method GET, POST, or HEAD only.
+headers Allowlist only: Accept, Accept-Language, Accept-Encoding, Cache-Control, If-None-Match, If-Modified-Since, If-Range, Range. Authorization and Cookie rejected outright. User-Agent forced to EXTENSION_PROXY_USER_AGENT.
+body Max EXTENSION_PROXY_MAX_REQUEST_BYTES. POST only.
+extension_id Required. Advisory. Used for rate-limit bucketing. Not authenticated.
+request_id Required. Echoed in the response. Client-generated.
+
+Response: Content Key encryption of { status, headers, body, request_id }.
+
+Response header allowlist: content-type, content-length, etag, last-modified, cache-control, expires, date, vary, location, retry-after. All other response headers are stripped.
+
+Behavior:
+
+1. Authenticate the caller.
+2. Decrypt the request with the Content Key.
+3. Validate the URL against the SSRF guard and the domain blocklist.
+4. Validate the method, headers, and body.
+5. Fetch the target URL with the configured timeouts.
+6. Follow redirects per method policy (GET/HEAD: all redirects up to 5; POST: 307/308 only).
+7. Decompress the response body.
+8. If the decompressed size exceeds EXTENSION_PROXY_MAX_RESPONSE_BYTES, reject with 502 upstream_response_too_large. Do not truncate.
+9. Re-encrypt the response with the Content Key.
+10. Return.
+
+Errors:
+
+Error HTTP error field
+Malformed request 400 invalid_request
+URL is SSRF-blocked 400 url_blocked
+URL is on the operator blocklist 400 domain_blocked
+Header not allowed 400 header_not_allowed
+Method not allowed 400 method_not_allowed
+Request body too large 413 request_too_large
+Fetch timeout 504 upstream_timeout
+Response too large 502 upstream_response_too_large
+Rate limited 429 rate_limited or bandwidth_limited
+Extension proxy disabled 501 extension_proxy_disabled
+Storage error 500 internal
+
+429 responses include Retry-After in seconds.
 
 8.2 User
 
@@ -1524,6 +1669,7 @@ POST /admin/key-transparency/snapshot Trigger a signed snapshot
 GET /admin/rooms/:id/sessions Read-only list of sessions (metadata only, no occupancy)
 POST /admin/models/reload Reload the model manifest
 POST /admin/session-types/reload Reload SESSION_TYPES.toml
+POST /admin/extension-proxy/reload-blocklist Reload the extension proxy domain blocklist
 
 8.3.1 POST /admin/session-types/reload
 
@@ -1560,6 +1706,39 @@ Error response (HTTP 400):
 ```
 
 Atomicity. The reload either succeeds and swaps the config, or fails and leaves the previous config in effect. There is no partial state.
+
+8.3.2 POST /admin/extension-proxy/reload-blocklist
+
+Auth: Required. Admin role.
+
+Request: None.
+
+Behavior:
+
+1. Read EXTENSION_PROXY_DENY_DOMAINS and EXTENSION_PROXY_DENY_DOMAINS_PATH.
+2. Validate. Malformed entries are logged as warnings and skipped.
+3. On success, atomically swap the in-memory blocklist.
+
+Success response (HTTP 200):
+
+```json
+{
+  "reloaded": true,
+  "domain_count": 42
+}
+```
+
+Error response (HTTP 400):
+
+```json
+{
+  "error": "invalid_blocklist",
+  "message": "Failed to load blocklist",
+  "details": { "path": "/data/deny-domains.txt", "reason": "file not found" }
+}
+```
+
+Atomicity. Same as session types reload.
 
 8.4 Rooms
 
@@ -1823,6 +2002,7 @@ Delivery semantics:
 · Room events: best-effort. Clients reconcile via REST.
 · User events: durable via user_seq. Live push over private-user-{user_id}; catch-up via GET /users/me/sync. Non-durable user events (call.signal, session.signal) are delivered live only.
 · session.occupancy is debounced to at most once per second per session. Coalesced changes publish the latest count.
+· The extension proxy has no events. It is a synchronous request/response endpoint.
 
 ---
 
@@ -1837,6 +2017,7 @@ server kt verify --from <index> Verify KT log integrity from an index
 server models verify Verify model files against manifest hashes
 server models fetch --from <url> Pre-seed models from a shared origin (proxy mode)
 server session-types validate Validate SESSION_TYPES.toml without starting the server
+server extension-proxy validate-blocklist Validate the domain blocklist without starting the server
 
 ---
 
@@ -1863,6 +2044,8 @@ Room events Best-effort; REST reconciliation
 Calls Signaling on room channel; TURN via dedicated endpoint
 Sessions Persistent metadata; in-memory occupancy; count-only room events; roster gated on participation; dense positions; cross-device leave permitted; opaque signal relay with unicast and broadcast modes; extension_id advisory; operator-configured type allowlist
 Model hosting Three modes: local, external, proxy. Capabilities advertise the base URL and mode.
+Link preview proxy Opt-in. OG metadata only. No auth.
+Extension proxy Opt-in. Requires auth. SSRF-guarded. Blind to URLs, bodies, credentials. Two-bucket rate limits. No streaming.
 Push notifications sender_ref replaces sender_user_id
 Client events client-typing.* only
 Delta sync (epoch, seq) cursor
@@ -1898,10 +2081,11 @@ Phase Deliverable Depends On
 41 Model hosting (STT + TTS), three modes 14
 42 Starred items 23, 24
 43 Generic preferences endpoint 23
+45 Extension proxy 4a, 35
 
-Critical path: 21 → 23 → 24 → 25. Phases 41 and 43 are independent and high-priority. Phase 40 closes the sessions work. Phase 42 is small on the server side.
+Note: Phase 44 is reserved. It was originally the Hangout clarifications phase and is absorbed by Amendment 35. The number is not reassigned to preserve historical references in task trackers.
 
-Note: V2 phase 44 (Hangout clarifications) is removed. Its contents are absorbed by Amendment 35.
+Critical path: 21 → 23 → 24 → 25. Phases 41 and 43 are independent and high-priority. Phase 40 closes the sessions work. Phase 42 is small on the server side. Phase 45 is opt-in and can be scheduled independently.
 
 ---
 
@@ -1940,6 +2124,12 @@ Session signal payloads are opaque Yes. Server relays bytes. No interpretation, 
 Session extension_id is authenticated No. It is advisory. Room membership is the authorization boundary.
 Session type allowlist Operator-configured via SESSION_TYPES.toml.
 delivered_to is logged server-side No. Returned to the caller but not persisted or logged.
+Extension proxy sees plaintext URLs No. URLs are decrypted in memory only.
+Extension proxy forwards credentials No. Authorization and Cookie are rejected.
+Extension proxy supports streaming No. Request/response only. Streaming uses direct fetch.
+Extension proxy logs requests No. Only aggregated hourly counts.
+Extension proxy caches responses No. Memory only, discarded after sending.
+Extension proxy can be bypassed by rotating extension_id No. Per-user total rate limit catches rotation.
 Model files are immutable and content-addressed Yes
 Model hosting can be shared across instances Yes, via external mode
 SPA bundle is version-coupled Yes (deployment concern, not a server feature)
@@ -1953,15 +2143,18 @@ Call-scoped co-presence is permitted. Within a call or session, the server knows
 
 The server routes a session; it does not remember it.
 
+The extension proxy is blind. The server decrypts URLs, request bodies, and response bodies in memory only, uses them to fulfill the request, and discards them. No URL, no header value, no body byte is written to any persistent store, log file, stdout, stderr, metrics pipeline, tracing system, or monitoring system. Only aggregated request counts per user per extension per hour are retained for audit. This is a normative constraint on all server code.
+
 ---
 
 13. Backups and Disaster Recovery
 
 Unchanged from V1 §13, with:
 
-· Backups include the OPRF key file, the ALTCHA HMAC secret, the key transparency log directory, the session types config, and all database contents.
+· Backups include the OPRF key file, the ALTCHA HMAC secret, the key transparency log directory, the session types config, the extension proxy domain blocklist, and all database contents.
 · Model files are included only if BACKUP_INCLUDE_MODELS=true. Default false.
 · Session occupancy is not part of any backup because it is not stored.
+· Extension proxy responses are not part of any backup because they are not stored.
 
 ---
 
@@ -1973,7 +2166,7 @@ Unchanged from V1 §14.1.
 
 14.2 Account Deletion
 
-Anonymises the user row, deletes devices, HTTP sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, device names, starred items). Queues MLS removes.
+Anonymises the user row, deletes devices, HTTP sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, device names, starred items). Queues MLS removes. Clears extension proxy rate-limit buckets for the user.
 
 Identity columns on deletion:
 
@@ -1984,6 +2177,8 @@ Identity columns on deletion:
 Room session records (room_sessions): where created_by is the deleted user are cascaded. Sessions the user merely participated in (but did not create) are unaffected and remain. In the normal account deletion path, the user row is anonymised rather than deleted, so the cascade does not fire — this is a defensive constraint for admin force-deletes and future schema evolution.
 
 Key transparency log: entries are retained (the log is append-only) but user_id is replaced with a random placeholder. The username_token in the KT log is retained because the log is the public audit record.
+
+Extension proxy: no per-user data is retained beyond the aggregated hourly audit count and the rate-limit buckets. Both are cleared on deletion.
 
 14.3 Data Export
 
@@ -1996,10 +2191,11 @@ Unchanged from V1 §14.3, plus:
 · Preferences are included.
 · Session participation is not in the export because it is not stored.
 · Created sessions are exported as metadata (session_id, room_id, extension_id, session_type, created_at). The metadata column is not exported. It is opaque ciphertext the controller cannot interpret. Session participation (occupancy) is not exported because it is not stored.
+· Extension proxy activity is not exported because no per-request records are retained. Aggregated hourly counts are not personal data.
 
 14.4 Retention
 
-Unchanged from V1 §14.4, plus sync_event_retention_days and key_transparency_retention_days. Session occupancy is not retained at all.
+Unchanged from V1 §14.4, plus sync_event_retention_days and key_transparency_retention_days. Session occupancy is not retained at all. Extension proxy requests and responses are not retained at all.
 
 14.5 Tombstone Semantics
 
@@ -2023,11 +2219,15 @@ session.occupancy N/A Not persisted; never exported
 Session roster N/A In-memory; gated on participation
 Session signal payloads N/A Never parsed, logged, or stored
 delivered_to N/A Returned to caller; not logged
+Extension proxy URLs N/A Decrypted in memory only; never logged
+Extension proxy request/response bodies N/A Decrypted in memory only; never logged
+Extension proxy credentials N/A Authorization and Cookie rejected
+Extension proxy domain counts N/A Only aggregated hourly counts per user per extension
 Model files N/A Immutable; not user data
 
 14.7 Controller Obligations
 
-Unchanged from V1 §14.7.
+Unchanged from V1 §14.7. The controller’s privacy policy must document that the extension proxy exists and what it does not log.
 
 14.8 Audit Actions
 
@@ -2047,8 +2247,12 @@ V1 actions plus:
 · session.delete
 · model.manifest_reload
 · session_types.reload
+· extension.proxy_request (aggregated hourly count only)
+· extension_proxy.reload_blocklist
 
 No audit entry is written for session join, leave, heartbeat, signal, or occupancy change. That would create exactly the log this design refuses.
+
+No audit entry is written per extension proxy request. Only aggregated hourly counts.
 
 ---
 
@@ -2279,6 +2483,65 @@ Change: Resolves six ambiguities in the sessions feature introduced by Amendment
 Sections affected: §5.6, §5.26.1, §7.9, §8.3, §8.7.11, §8.8, §14.3.
 
 Affected tasks: 40a through 40d.
+
+16.26 Amendment 38 — Extension Proxy Endpoint — 2026-10-02
+
+Change: Added a general-purpose proxy endpoint for client extensions that need network access without exposing user credentials or IP addresses to third-party services. Sibling to the link preview proxy (Amendment 20). Shares its SSRF guard, Content Key encryption, and no-logging posture. Adds authentication, per-extension rate limiting, per-user total limits, and larger size limits.
+
+Endpoint: POST /api/v1/extensions/proxy
+
+Authentication: Required. Authorization: Bearer <session_token>.
+
+Request: Content Key encryption of a JSON document containing url, method, headers, body, extension_id, request_id.
+
+Constraints:
+
+· url: HTTPS only. Private IP ranges rejected. Max 2048 chars.
+· method: GET, POST, or HEAD.
+· headers: allowlist only — Accept, Accept-Language, Accept-Encoding, Cache-Control, If-None-Match, If-Modified-Since, If-Range, Range. Authorization and Cookie rejected outright. User-Agent forced to the operator-configured value.
+· body: max 256 KB. POST only.
+· extension_id: advisory. Used for rate-limit bucketing. Not authenticated.
+· request_id: echoed in the response.
+
+Response:
+
+· Content Key encryption of { status, headers, body, request_id }.
+· Response header allowlist: content-type, content-length, etag, last-modified, cache-control, expires, date, vary, location, retry-after.
+· Upstream responses decompressed transparently. content-encoding stripped.
+· Size limit applies to the decompressed body.
+· Responses exceeding the limit are rejected with 502 upstream_response_too_large. No silent truncation.
+· Redirects: followed for GET/HEAD (max 5 hops, each validated against SSRF guard). For POST, 307 and 308 followed; 301, 302, 303 returned to the client without following.
+
+Content Key mechanism: identical to the link preview proxy (§8.1.2). No new cryptography.
+
+Default: EXTENSION_PROXY_ENABLED=false. Operators opt in.
+
+Rate limiting: Two buckets, both must pass.
+
+· Per user, per extension: extension_proxy:{user_id}:{extension_id}:{minute|hour|day}:{boundary}
+· Per user total: extension_proxy_total:{user_id}:{minute|hour|day}:{boundary}
+
+Bandwidth counted against both buckets.
+
+Domain blocklist: Operator-controlled. Checked after decryption, before the request is made. No operator-configurable allowlist.
+
+Security model: inherits SSRF protection, URL encryption, and no-logging from the link preview proxy. Adds authentication and rejects credential forwarding.
+
+Non-goals: streaming, credential forwarding, response caching, WebSocket/WebRTC proxying, content transformation, per-URL allowlist, request deduplication.
+
+Audit: aggregated extension.proxy_request counts per user per extension per hour. No per-request entries. No URLs.
+
+Sections affected: §2.1, §2.3, §4.5, §5.6, §5.31 (new), §6.30 (new), §8.1, §8.1.5 (new), §8.3, §8.3.2 (new), §9, §10, §11, §12, §13, §14, §16.
+
+Affected tasks: new Phase 45. Tasks 45.1 (extension-proxy-core), 45.2 (extension-proxy-limits), 45.3 (extension-proxy-config).
+
+16.27 Amendment 39 — Extension Proxy Response Size Handling — 2026-10-02
+
+Change: §8.1.5 corrected. Responses exceeding EXTENSION_PROXY_MAX_RESPONSE_BYTES are rejected with 502 upstream_response_too_large, not silently truncated. Rationale: silent truncation is a correctness hazard for extensions parsing RSS, JSON, or HTML. A clear error lets the extension retry with transport: 'direct'. Extensions that want a bounded prefix can send Range: bytes=0-N for an explicit 206 Partial Content response from upstream.
+
+Sections affected: §8.1.5, §12.
+
+Affected tasks: 45.1.
 
 ---
 
