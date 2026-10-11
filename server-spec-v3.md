@@ -1,7 +1,7 @@
-# Server Specification v3.0.3
+# Server Specification v3.0.4
 
 **Status:** Final — source of truth for all v3.0 implementation tasks.
-**Supersedes:** Server Specification v3.0.2, which superseded v3.0.1, which superseded v3.0. This is a clean break from v2.0. No v2.0 content is carried forward by reference; every section is restated in v3.0 terms.
+**Supersedes:** Server Specification v3.0.3, which superseded v3.0.2, which superseded v3.0.1, which superseded v3.0. This is a clean break from v2.0. No v2.0 content is carried forward by reference; every section is restated in v3.0 terms.
 **Scope:** Server-side contract only. Client implementation is out of scope and is covered by Client Specification v2.0.
 **Stack:** Sockudo + Axum + SQLite + OPAQUE (opaque-ke 4.0.1) + VOPRF (voprf 0.5.0) + ALTCHA + S3 (or filesystem).
 **Deployment:** Single VPS, Docker-based, self-hosted. Two containers: server (Axum + static SPA hosting) and sockudo. TLS terminates at a reverse proxy.
@@ -51,6 +51,7 @@ A self-hosted, end-to-end encrypted group messaging system with MLS-grade forwar
 - Secret values.
 - Bot command plaintext.
 - Extension proxy URLs, request bodies, response bodies.
+- Link preview proxy URLs, request bodies, response bodies.
 - Sockudo app secret.
 
 ### 1.3 What the server can enumerate
@@ -66,6 +67,7 @@ Low-entropy usernames. The operator holds the OPRF key k. The lookup token is de
 - Session signal payloads.
 - Call signal payloads.
 - Local messages.
+- Link preview URLs, request bodies, or response bodies.
 
 ### 1.5 Technology layers
 
@@ -81,9 +83,11 @@ Low-entropy usernames. The operator holds the OPRF key k. The lookup token is de
 | Username lookup | VOPRF (Ristretto255-SHA512) via voprf 0.5.0 |
 | Bot protection | ALTCHA Proof-of-Work v2 via altcha 0.2.0 |
 | Attachment encryption | C2SP chunked encryption (c2sp.org/chunked-encryption) |
+| Content Key agreement | Ephemeral-static X25519 ECDH, AES-256-GCM |
 | Static SPA hosting | Axum ServeDir with SPA fallback |
 | Model hosting | Instance-local, external shared origin, or proxy-with-cache |
 | Extension proxy | SSRF-guarded egress gateway for client extensions |
+| Link preview proxy | SSRF-guarded metadata fetcher for link previews |
 | TLS termination | External reverse proxy (Traefik via Coolify, or Caddy) |
 
 ### 1.6 Architectural principles
@@ -96,6 +100,7 @@ Low-entropy usernames. The operator holds the OPRF key k. The lookup token is de
 6. Extensions and bots do not implement cryptographic primitives. The client runtime provides typed APIs. This is a client-side architectural constraint, stated in the server spec so the wire contract is stable.
 7. Bots are headless clients. They run on the operator's machine, not on the server, and not inside a user's client. Tier guarantees are cryptographic, not policy.
 8. Sockudo handles transport. The server authenticates subscriptions; it does not route WebSocket traffic itself.
+9. One Content Key mechanism. Ephemeral-static X25519 ECDH with AES-256-GCM is used everywhere content keys are needed: link preview proxy, extension proxy, bot settings encryption, and bot command result encryption. The server holds one static X25519 keypair, shared by the two proxies, distinguished only by HKDF info string.
 
 ---
 
@@ -120,8 +125,8 @@ Low-entropy usernames. The operator holds the OPRF key k. The lookup token is de
 - Retention change preview.
 - MLS adds coordination. `pending_mls_adds` with user and bot targets.
 - MLS removes coordination. `pending_mls_removes` with user and bot targets, stale signal, durable confirmation.
-- Key transparency. Append-only log with inclusion proofs and auditor signatures. Extended with bot identity keys and command keys. Historical verification via `bot_key_leaf_index`. User and bot endpoints.
-- Link preview proxy. Opt-in, SSRF-guarded, blind to URLs.
+- Key transparency. Append-only log with inclusion proofs and auditor signatures. Extended with bot identity keys and command keys. Historical verification via `bot_key_leaf_index`. User and bot endpoints. Canonical leaf serialization for both user and bot leaves.
+- Link preview proxy. Opt-in, SSRF-guarded, blind to URLs. Ephemeral-static X25519 Content Key.
 - Extension proxy. Opt-in, SSRF-guarded egress gateway. Blind to URLs, request bodies, response bodies, and credentials.
 - Call signaling. WebRTC signaling on user channels, gated on call participation, encrypted with per-call ephemeral ECDH.
 - TURN credential endpoint.
@@ -175,6 +180,7 @@ Call IP addresses are exposed between WebRTC peers. ICE candidates include host 
 - Room events for extension sync without a session.
 - Streaming through the extension proxy.
 - Extension proxy response caching.
+- Link preview proxy response caching.
 - Bot marketplace or discovery.
 - Bot runtime hosted on the server.
 - Bot runtime hosted inside a user's client.
@@ -213,11 +219,13 @@ Call IP addresses are exposed between WebRTC peers. ICE candidates include host 
 | Bot command results | Absent | Ephemeral X25519 per command; `bot.command_result` |
 | Bot owner local messages | Absent | `bot.local_message` via `POST /bots/me/messages` |
 | Settings/commands | Extension-local | Declarative; server defines sync contract |
-| KT log | User identity keys | Extended with bot identity and command keys; user and bot endpoints |
+| KT log | User identity keys | Extended with bot identity and command keys; user and bot endpoints; canonical leaf serialization |
 | Whisper messages | Absent | `target_user_ids` on messages |
 | Read counts | Absent | `read_by_count` on message fetch; live event |
 | Call history | Absent | `GET /rooms/:id/calls` |
 | Sockudo connection params | Capabilities `websocket_url`, `sockudo_app_key` | Capabilities `sockudo_url`, `sockudo_app_key`, `sockudo_auth_endpoint`; server-issued subscription auth |
+| Link preview proxy | RSA-OAEP wrapper | Ephemeral-static X25519; shared static keypair with extension proxy |
+| Content Key mechanism | Divergent per endpoint | Unified X25519 ephemeral-static across link preview, extension proxy, bot settings, bot command results |
 | Security boundary table | Contained disproven claims | Corrected; enumeration, social graph, occupancy, IP exposure |
 | Product summary | "Never sees meaningful metadata" | Explicit list of what the server sees |
 
@@ -327,7 +335,7 @@ All jobs run on the shared hourly scheduler.
 | Extension proxy bandwidth accounting | 24 hours | — |
 | Call record retention | `CALL_RECORD_RETENTION_DAYS` (365) | Deletes `call_sessions` rows with `ended_at < now - retention`. No cascade; there is no `call_participants` table. |
 
-No cleanup job is required for session occupancy, call participation, bot connection status, publisher keys, observer stream cursors, or local messages. These are in-memory, client-only, or persisted with their own lifecycle.
+No cleanup job is required for session occupancy, call participation, bot connection status, publisher keys, observer stream cursors, local messages, link preview URLs, or link preview request/response bodies. These are in-memory, client-only, or persisted with their own lifecycle.
 
 ---
 
@@ -343,7 +351,7 @@ LOG_LEVEL=info
 CLIENT_STATIC_DIR=/app/client
 ```
 
-Log policy: the server writes structured logs to stdout and stderr only. It does not write log files. Session occupancy, call participation, bot connection status, publisher keys, observer stream contents, call signaling payloads, session signal payloads, and extension proxy URLs/bodies are never logged — not to stdout, not to stderr, not to metrics, not to tracing.
+Log policy: the server writes structured logs to stdout and stderr only. It does not write log files. Session occupancy, call participation, bot connection status, publisher keys, observer stream contents, call signaling payloads, session signal payloads, extension proxy URLs/bodies, and link preview proxy URLs/bodies are never logged — not to stdout, not to stderr, not to metrics, not to tracing.
 
 ### 5.2 Server
 
@@ -442,6 +450,7 @@ Key formats (excerpt):
 | BotLocalMessage | `bot_local_message:{bot_id}:min:{boundary}` |
 | BotKeyRotate | `bot_key_rotate:{bot_id}:hour:{boundary}` |
 | SockudoAuth | `sockudo_auth:{identity}:min:{boundary}` — where `{identity}` is `user:{user_id}` or `bot:{bot_id}` |
+| LinkPreview | `link_preview:{user_id}:min:{boundary}` |
 | ExtensionProxy | `extension_proxy:{user_id}:{extension_id}:{minute\|hour\|day}:{boundary}` |
 | ExtensionProxyTotal | `extension_proxy_total:{user_id}:{minute\|hour\|day}:{boundary}` |
 
@@ -451,6 +460,7 @@ Rate limit state is stored in SQLite and pruned hourly.
 
 | Rate limit | Applies to |
 |---|---|
+| `RATE_LINK_PREVIEW_PER_MIN` | `POST /link-preview/proxy` (per authenticated user) |
 | `RATE_BOT_FETCH_PER_MIN` | `GET /rooms/:id/publisher-key`, `GET /rooms/:id/bots`, `GET /bots/me/settings`, `GET /kt/bot/:id`, `GET /kt/bot/:id/history`, `GET /kt/user/:id`, `GET /bots/:id/tokens` |
 | `RATE_BOT_OBSERVER_STREAM_PER_MIN` | Connection attempts to `GET /rooms/:id/observer-stream` |
 | `RATE_BOT_MESSAGE_PER_MIN` | `POST /rooms/:id/bot-messages` |
@@ -504,7 +514,7 @@ Base mode rationale. Verifiable mode (VOPRF) is not used. The operator can alrea
 
 ### 5.9 Backups
 
-Backups include: the OPRF key, the ALTCHA HMAC secret, the VAPID keys, the KT log directory, the session types config, the extension proxy domain blocklist, the `server_config` table (including the Sockudo app secret, treated as sensitive), and all other database contents. Attachment blobs are included only if `BACKUP_INCLUDE_ATTACHMENTS=true` and `STORAGE_BACKEND=fs`. Model files are included only if `BACKUP_INCLUDE_MODELS=true`. Session occupancy, call participation, bot connection status, observer cursors, and local messages are not part of any backup because they are not stored. Publisher keys persisted in `room_publisher_keys` are part of the database and are backed up with it.
+Backups include: the OPRF key file, the ALTCHA HMAC secret, the VAPID keys, the KT log directory, the session types config, the extension proxy domain blocklist, the `LINK_PREVIEW_PROXY_KEY_PATH` file, the `server_config` table (including the Sockudo app secret, treated as sensitive), and all other database contents. Attachment blobs are included only if `BACKUP_INCLUDE_ATTACHMENTS=true` and `STORAGE_BACKEND=fs`. Model files are included only if `BACKUP_INCLUDE_MODELS=true`. Session occupancy, call participation, bot connection status, observer cursors, local messages, and link preview request/response bodies are not part of any backup because they are not stored. Publisher keys persisted in `room_publisher_keys` are part of the database and are backed up with it.
 
 ### 5.10 Push Notifications
 
@@ -639,7 +649,19 @@ Client-visible verification state (normative):
 LINK_PREVIEW_PROXY_ENABLED=false
 LINK_PREVIEW_PROXY_TIMEOUT_SECONDS=5
 LINK_PREVIEW_PROXY_MAX_BYTES=1048576
+LINK_PREVIEW_PROXY_KEY_PATH=./data/link-preview.key
 ```
+
+Field semantics:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `LINK_PREVIEW_PROXY_ENABLED` | No | Enables the endpoint. |
+| `LINK_PREVIEW_PROXY_TIMEOUT_SECONDS` | No | Per-request upstream timeout. |
+| `LINK_PREVIEW_PROXY_MAX_BYTES` | No | Response body cap. |
+| `LINK_PREVIEW_PROXY_KEY_PATH` | No | Path to the static X25519 keypair. Defaults to `./data/link-preview.key`. 32 bytes, raw. Generated at first boot if the file does not exist. Permissions `0600` on Unix. Shared with the extension proxy. |
+
+The same static keypair serves the link preview proxy and the extension proxy. Each proxy uses a distinct HKDF info string to prevent replay between the two: `"link-preview-content-key-v1"` for the link preview proxy and `"extension-proxy-content-key-v1"` for the extension proxy.
 
 ### 5.24 Calls
 
@@ -742,6 +764,8 @@ EXTENSION_PROXY_DENY_DOMAINS_PATH=
 
 Two-bucket rate limiting: per user per extension, and per user total. Domain blocklist checked after decryption, before request. No operator allowlist. Reject `Authorization` and `Cookie` headers by name.
 
+**Shared key file.** The extension proxy uses the same static X25519 keypair as the link preview proxy, loaded from `LINK_PREVIEW_PROXY_KEY_PATH`. No separate key file exists. The two endpoints use distinct HKDF info strings to prevent replay between them: `"extension-proxy-content-key-v1"` for the extension proxy and `"link-preview-content-key-v1"` for the link preview proxy.
+
 ### 5.32 Bot Infrastructure
 
 ```env
@@ -830,7 +854,7 @@ Only `client-typing.start` and `client-typing.stop`. Client events are ephemeral
 
 ### 6.17 Client Capability Requirements
 
-Standard capability negotiation. The three Sockudo fields are part of the unauthenticated capabilities response; the client must fetch capabilities before attempting WebSocket connection.
+Standard capability negotiation. The three Sockudo fields and `extension_proxy_key` are part of the unauthenticated capabilities response; the client must fetch capabilities before attempting a WebSocket connection or a content-key exchange.
 
 ### 6.18 CoreCrypto Initialization
 
@@ -944,10 +968,13 @@ The client MUST treat session revocation on other devices as expected.
 
 ### 6.25 Link Preview Proxy
 
-1. Fetch `link_preview_proxy_enabled` from `/capabilities`.
-2. When enabled and a URL is CORS-blocked, encrypt the URL with a per-request Content Key.
-3. Send the encrypted URL to `POST /link-preview/proxy`.
-4. Decrypt the response with the Content Key.
+1. Fetch `link_preview_proxy_enabled` and `extension_proxy_key` from `/capabilities`.
+2. When enabled and a URL is CORS-blocked, generate an ephemeral X25519 keypair.
+3. Derive `shared = ECDH(client_ephemeral_private, extension_proxy_key)`.
+4. Derive the Content Key: `key = HKDF-Expand(shared, "link-preview-content-key-v1", 32)` (SHA-256).
+5. Encrypt `{ url, request_id }` with AES-256-GCM under `key`, random 12-byte nonce.
+6. Send `POST /link-preview/proxy` with `{ ephemeral_pubkey, nonce, ciphertext }`.
+7. Receive `{ nonce, ciphertext }`, decrypt with the same Content Key, and use the resulting `{ status, headers, body, request_id }`.
 
 The server never sees the plaintext URL.
 
@@ -1001,12 +1028,15 @@ Reserved keys: `room_order` is not a preference; it has its own endpoint and tab
 
 ### 6.30 Extension Proxy
 
-1. Fetch `extension_proxy_enabled` from `/capabilities`.
-2. Encrypt the request with a per-request Content Key. Send `POST /extensions/proxy`.
-3. Decrypt the response with the same Content Key.
-4. Handle `502 upstream_response_too_large` by retrying with `transport: 'direct'`.
-5. Handle `429` with `Retry-After`.
-6. Handle `400 header_not_allowed` by falling back to direct fetch.
+1. Fetch `extension_proxy_enabled` and `extension_proxy_key` from `/capabilities`.
+2. Generate an ephemeral X25519 keypair.
+3. Derive `shared = ECDH(client_ephemeral_private, extension_proxy_key)`.
+4. Derive the Content Key: `key = HKDF-Expand(shared, "extension-proxy-content-key-v1", 32)` (SHA-256).
+5. Encrypt the request with AES-256-GCM under `key`. Send `POST /extensions/proxy`.
+6. Decrypt the response with the same Content Key.
+7. Handle `502 upstream_response_too_large` by retrying with `transport: 'direct'`.
+8. Handle `429` with `Retry-After`.
+9. Handle `400 header_not_allowed` by falling back to direct fetch.
 
 ### 6.31 Bot Commands and Settings
 
@@ -1061,7 +1091,7 @@ Flow for `PATCH /users/me/bots/:bot_id/settings/:key`:
 3. `shared = ECDH(ephemeral_private, bot_command_pubkey)`.
 4. `key = HKDF-Expand(shared, "bot-settings-v1", 32)` (SHA-256).
 5. Value encrypted with AES-256-GCM under `key`.
-6. Client sends `{ is_secret, value_encrypted_bot, value_encrypted_client? }`. The ephemeral public key is embedded in the wire value (see §8.8.11).
+6. Client sends `{ is_secret, value_encrypted_bot, value_encrypted_client? }`. The ephemeral public key is embedded in the wire value (see §8.8.14).
 7. Bot decrypts with its `bot_command_private_key` and the embedded ephemeral pubkey.
 
 Non-secret settings:
@@ -1433,7 +1463,7 @@ CREATE INDEX idx_reactions_message ON reactions(message_id)
 CREATE INDEX idx_reactions_room ON reactions(room_id, created_at DESC);
 ```
 
-`bot_key_leaf_index` is populated only when `sender_bot_id` is non-NULL. It records the KT log leaf index of the bot's currently active `bot_identity_pubkey` at insertion time. Messages signed with rotated-out keys are rejected; see §8.8.8.
+`bot_key_leaf_index` is populated only when `sender_bot_id` is non-NULL. It records the KT log leaf index of the bot's currently active `bot_identity_pubkey` at insertion time. Messages signed with rotated-out keys are rejected; see §8.8.10.
 
 Edit model. An edit is a new `room_messages` row with `edit_of = <original>` and `edit_sequence = <previous + 1>`. The original row remains. Edits are rejected if `now - created_at > edit_window_seconds`.
 
@@ -1644,7 +1674,7 @@ CREATE INDEX idx_bot_request_log_ttl ON bot_request_log(created_at);
 
 `bot_settings.value_encrypted_bot` wire format: `ephemeral_pubkey (32) || nonce (12) || ciphertext || tag (16)`, base64url-encoded. The server does not parse. The bot parses after fetch.
 
-`bot_accounts.declarations` is a JSON object with `schema_version`, `commands`, and `settings`. The server validates the top-level shape only. Contents are opaque. See §8.8.1 for the response shape.
+`bot_accounts.declarations` is a JSON object with `schema_version`, `commands`, and `settings`. The server validates the top-level shape only. Contents are opaque. See §8.8.2 for the response shape.
 
 Bot model:
 
@@ -1660,13 +1690,14 @@ Bot model:
 
 ```sql
 CREATE TABLE key_transparency_log (
-    leaf_index       INTEGER PRIMARY KEY,
-    user_id          TEXT REFERENCES users(id) ON DELETE CASCADE,
-    bot_id           TEXT REFERENCES bot_accounts(id) ON DELETE CASCADE,
-    username_token   TEXT,
-    identity_pubkey  TEXT,
-    command_pubkey   TEXT,
-    added_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    leaf_index           INTEGER PRIMARY KEY,
+    user_id              TEXT REFERENCES users(id) ON DELETE CASCADE,
+    bot_id               TEXT REFERENCES bot_accounts(id) ON DELETE CASCADE,
+    username_token       TEXT,
+    bot_identity_pubkey  TEXT,
+    identity_pubkey      TEXT,
+    command_pubkey       TEXT,
+    added_at             DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK (
         (user_id IS NOT NULL AND bot_id IS NULL)
         OR
@@ -1689,6 +1720,45 @@ CREATE TABLE key_transparency_snapshots (
 ```
 
 The `username_token` column is stored for user entries. It is excluded from all KT API responses. See §8.11 and §12.
+
+**Leaf serialization.**
+
+A user leaf is serialized as:
+
+```
+serialize_user_leaf(username_token, identity_pubkey)
+    = I2OSP(len(username_token), 2) || username_token
+    || I2OSP(len(identity_pubkey), 2) || identity_pubkey
+```
+
+This format is carried forward from v2.0. It is unchanged. It is restated here so that both leaf formats appear in one place.
+
+A bot leaf is serialized as:
+
+```
+serialize_bot_leaf(bot_identity_pubkey, command_pubkey, identity_pubkey)
+    = I2OSP(len(bot_identity_pubkey), 2) || bot_identity_pubkey
+    || I2OSP(len(command_pubkey), 2) || command_pubkey
+    || I2OSP(len(identity_pubkey), 2) || identity_pubkey
+```
+
+Each length prefix is a 16-bit big-endian unsigned integer. Each field is the UTF-8 byte sequence of the base64url-encoded string as stored in the corresponding column. The three fields appear in the order listed. This order is authoritative. It is independent of the SQLite column order of `key_transparency_log`.
+
+**Hashing.** Leaf and internal node hashing are unchanged from v2.0:
+
+- Leaf hash: `SHA-256(0x00 || leaf_bytes)`.
+- Internal node hash: `SHA-256(0x01 || left_hash || right_hash)`.
+- Empty tree: `root_hash = SHA-256("")`.
+- Single-leaf tree: `root_hash = leaf_hash`.
+- RFC 6962 split rule: `k = 1 << (31 - (N - 1).leading_zeros())`.
+
+**Tree composition.** User and bot leaves inhabit the same Merkle tree. A tree with interleaved user and bot leaves is valid. The `leaf_index` column is the tree's positional index; the `key_transparency_log` primary key enforces uniqueness.
+
+**Signing.** The signing key derivation and signing input are unchanged from v2.0:
+
+- `root_secret = SHA-256(oprf_key_bytes)`.
+- `kt_signing_seed = HKDF-Expand(root_secret, info="key-transparency-signing-v1", length=32)`.
+- `signing_input = I2OSP(tree_size, 8) || root_hash`.
 
 ### 7.12 Server Config
 
@@ -1718,6 +1788,7 @@ Backup: both values are included in database backups. The app secret must be tre
 | `MODEL_STORAGE_PATH` | Model files | Immutable. Optional in external mode. |
 | `SESSION_TYPES_CONFIG_PATH` | Session type allowlist | Operator-maintained. |
 | `EXTENSION_PROXY_DENY_DOMAINS_PATH` | Domain blocklist | Operator-maintained. |
+| `LINK_PREVIEW_PROXY_KEY_PATH` | Static X25519 keypair for content-key derivation | Shared by the link preview proxy and the extension proxy. Generated at first boot. 0600 permissions. Included in backups. |
 
 Publisher keys are persisted in `room_publisher_keys`. They are not in-memory.
 
@@ -1741,6 +1812,8 @@ SPA served from `CLIENT_STATIC_DIR` with SPA fallback. HTTPS enforced in product
 
 ### 8.1 Public
 
+**Public** in this table means "no room role is required." It does not mean "unauthenticated." Two endpoints in this table are marked Auth: Required in their subsections: `POST /extensions/proxy` (§8.1.5) and `POST /link-preview/proxy` (§8.1.2). The others are genuinely unauthenticated.
+
 | Method | Path | Purpose |
 |---|---|---|
 | GET | /health | Liveness |
@@ -1756,8 +1829,8 @@ SPA served from `CLIENT_STATIC_DIR` with SPA fallback. HTTPS enforced in product
 | POST | /invites/redeem | Validate and consume server invite |
 | GET | /invites/:code | Public invite validation |
 | POST | /oprf/blind | OPRF evaluation |
-| POST | /link-preview/proxy | Link preview proxy (opt-in) |
-| POST | /extensions/proxy | Extension proxy (opt-in, requires auth) |
+| POST | /link-preview/proxy | Link preview proxy (opt-in, Auth: Required) |
+| POST | /extensions/proxy | Extension proxy (opt-in, Auth: Required) |
 | GET | /models/stt/v1/:model_id/:version/:filename | STT model files |
 | GET | /models/tts/v1/:model_id/:version/:filename | TTS model files |
 | GET | /models/manifest.json | Model manifest |
@@ -1767,7 +1840,7 @@ SPA served from `CLIENT_STATIC_DIR` with SPA fallback. HTTPS enforced in product
 
 ```json
 {
-  "version": "3.0.3",
+  "version": "3.0.4",
   "sockudo_url": "wss://chat.example.com/sockudo",
   "sockudo_app_key": "a1b2c3d4e5f6g7h8",
   "sockudo_auth_endpoint": "/sockudo/auth",
@@ -1785,6 +1858,7 @@ SPA served from `CLIENT_STATIC_DIR` with SPA fallback. HTTPS enforced in product
   "key_transparency_auditor_count": 0,
   "link_preview_proxy_enabled": false,
   "extension_proxy_enabled": false,
+  "extension_proxy_key": "<base64url, 32 bytes X25519>",
   "extension_proxy_max_request_bytes": 262144,
   "extension_proxy_max_response_bytes": 10485760,
   "extension_proxy_supports_streaming": false,
@@ -1815,6 +1889,12 @@ SPA served from `CLIENT_STATIC_DIR` with SPA fallback. HTTPS enforced in product
 }
 ```
 
+Field semantics for the content-key related fields:
+
+- `extension_proxy_key` — the server's static X25519 public key, base64url-encoded, 32 bytes decoded. Present whenever either `link_preview_proxy_enabled` or `extension_proxy_enabled` is true. Absent otherwise. The same key serves both proxies; the two endpoints use distinct HKDF info strings.
+- `link_preview_proxy_enabled` — enables `POST /link-preview/proxy`.
+- `extension_proxy_enabled` — enables `POST /extensions/proxy`.
+
 The three `sockudo_*` fields are included in the unauthenticated response. The app key is public by Pusher design; the URL is the address clients must connect to; the auth endpoint path is public and requires a bearer token when called. Gating any of these behind authentication adds a boot-sequence dependency for no security gain. `sockudo_channel_prefix` is deliberately not exposed; channel prefixes are structural and clients hardcode them.
 
 #### 8.1.1 POST /oprf/blind
@@ -1826,12 +1906,42 @@ Response: `{ "evaluated": "<base64>" }`
 
 #### 8.1.2 POST /link-preview/proxy
 
-Auth: None. Rate limit: `RATE_LINK_PREVIEW_PER_MIN`, per IP.
+Auth: Required. Bearer session token. The endpoint is listed in §8.1's Public table because it does not require a room role; it does require an authenticated user.
 
-Request: `{ "encrypted_url": "<base64>", "wrapped_content_key": "<base64, RSA-OAEP>", "nonce": "<base64, 12 bytes>" }`
-Response: `{ "encrypted_metadata": "<base64>", "nonce": "<base64, 12 bytes>" }`
+Rate limit: `RATE_LINK_PREVIEW_PER_MIN`, per authenticated user. Key format `link_preview:{user_id}:min:{boundary}` per §5.6.
 
-SSRF protection: DNS resolution with private/loopback/link-local/multicast rejection; IP pinning; redirect re-validation; HTTP(S) only; body size cap; timeout; strip all HTML.
+**Request:**
+
+```json
+{
+  "ephemeral_pubkey": "<base64url, 32 bytes X25519>",
+  "nonce": "<base64url, 12 bytes>",
+  "ciphertext": "<base64url>"
+}
+```
+
+**Response:**
+
+```json
+{
+  "nonce": "<base64url, 12 bytes>",
+  "ciphertext": "<base64url>"
+}
+```
+
+**Content Key mechanism.** Ephemeral-static X25519 ECDH. The client generates an ephemeral X25519 keypair. The shared secret is `ECDH(client_ephemeral_private, server_static_public)`. The Content Key is `HKDF-Expand(shared, "link-preview-content-key-v1", 32)` with SHA-256. The plaintext is encrypted with AES-256-GCM using the `nonce`.
+
+The server's static X25519 public key is exposed in `GET /capabilities` as `extension_proxy_key`. The same keypair serves the link preview proxy and the extension proxy. Each proxy uses a distinct HKDF info string to prevent replay between the two: `"link-preview-content-key-v1"` for this endpoint and `"extension-proxy-content-key-v1"` for §8.1.5.
+
+The static keypair is loaded from `LINK_PREVIEW_PROXY_KEY_PATH` (default `./data/link-preview.key`) or generated at first boot. The file is 32 bytes and is set to `0600` permissions on Unix.
+
+**Request plaintext.** `{ "url": "<https URL>", "request_id": "<string>" }`.
+
+**Response plaintext.** `{ "status": <u16>, "headers": { ... }, "body": "<base64>", "request_id": "<string>" }`.
+
+**Error plaintext.** `{ "error": "<code>", "request_id": "<string>" }`.
+
+**SSRF protection.** DNS resolution with private/loopback/link-local/multicast rejection; IP pinning; redirect re-validation; HTTP(S) only; body size cap; timeout; strip all HTML.
 
 #### 8.1.3 GET /models/stt/v1/... and GET /models/tts/v1/...
 
@@ -1851,7 +1961,9 @@ Auth: Required. `Content-Type: application/octet-stream`.
 
 Rate limits: two buckets, both must pass. Per user per extension (`EXTENSION_PROXY_MAX_REQUESTS_PER_MIN`/`_PER_HOUR`), and per user total (`EXTENSION_PROXY_MAX_REQUESTS_PER_MIN_TOTAL`/`_PER_HOUR_TOTAL`). Bandwidth counted against both.
 
-Request: Content Key encryption of `{ url, method, headers, body, extension_id, request_id }`.
+**Content Key mechanism.** Ephemeral-static X25519 ECDH. Same key agreement as §8.1.2, with a distinct HKDF info string: `"extension-proxy-content-key-v1"`. The static keypair is loaded from `LINK_PREVIEW_PROXY_KEY_PATH` and is shared with the link preview proxy.
+
+Request: Content Key encryption of `{ url, method, headers, body, extension_id, request_id }`. Envelope shape: `{ ephemeral_pubkey, nonce, ciphertext }`.
 
 Constraints: URL HTTPS only, private IPs rejected, max 2048 chars. Method GET/POST/HEAD. Headers allowlist: `Accept`, `Accept-Language`, `Accept-Encoding`, `Cache-Control`, `If-None-Match`, `If-Modified-Since`, `If-Range`, `Range`. `Authorization` and `Cookie` rejected outright. User-Agent forced. Body max 256 KB, POST only. `extension_id` advisory. `request_id` echoed.
 
@@ -2884,6 +2996,8 @@ signed = nonce (12 bytes)
 
 No length prefixes. Nonce and tag are fixed-length and bracket the variable-length field, so the ciphertext length is unambiguous. This is the only context that uses this pattern.
 
+**Note on KT leaf serialization.** The KT leaf serialization in §7.11 is a SHA-256 hashing preimage, not an Ed25519 signing preimage. It is defined in §7.11 alongside the KT table. It is not part of this section.
+
 ### 8.11 Key Transparency Endpoints
 
 | Method | Path | Purpose |
@@ -3014,8 +3128,9 @@ Returned on demand. Used as the fallback for `kt.snapshot` events, which are non
 | Bot command results | Ephemeral X25519 per command; `bot.command_result` on invoker's user channel |
 | Bot owner local messages | `bot.local_message` via `POST /bots/me/messages` |
 | Model hosting | Three modes: local, external, proxy |
-| Link preview proxy | Opt-in. OG metadata only. No auth. |
-| Extension proxy | Opt-in. Requires auth. SSRF-guarded. Blind to URLs, bodies, credentials. |
+| Link preview proxy | Opt-in. Auth required. Ephemeral-static X25519 Content Key. SSRF-guarded. Blind to URLs. |
+| Extension proxy | Opt-in. Auth required. Ephemeral-static X25519 Content Key. SSRF-guarded. Blind to URLs, bodies, credentials. |
+| Shared Content Key | Both proxies use the same static X25519 keypair; distinct HKDF info strings |
 | Push notifications | `sender_ref` replaces `sender_user_id` |
 | Client events | `client-typing.*` only |
 | Delta sync | `(epoch, seq)` cursor; REST fetch is authoritative |
@@ -3025,6 +3140,7 @@ Returned on demand. Used as the fallback for `kt.snapshot` events, which are non
 | Read counts | Aggregate per message; attached to message fetch; live event non-durable |
 | Call history | `GET /rooms/:id/calls`; all room members |
 | Sockudo connection | `sockudo_url`, `sockudo_app_key`, `sockudo_auth_endpoint` in capabilities; server issues subscription auth |
+| KT leaf serialization | Canonical user and bot formats in §7.11; inclusion proofs reproducible |
 
 ---
 
@@ -3079,6 +3195,8 @@ Returned on demand. Used as the fallback for `kt.snapshot` events, which are non
 | 45 | Bot owner local messages (`POST /bots/me/messages` owner target, `bot.local_message`) | 44 |
 | 46 | Idempotency (`bot_request_log`, `request_id`) | 27 |
 | 47 | User KT endpoint (`GET /kt/user/:id`) | 16 |
+| 48 | KT leaf serialization (user and bot) | 16 |
+| 49 | Link preview proxy Content Key rewrite (X25519, shared key) | 17, 26 |
 
 Critical path: 1 → 3 → 4 → 5. Phase 33 closes the adversarial review.
 
@@ -3144,15 +3262,21 @@ Critical path: 1 → 3 → 4 → 5. Phase 33 closes the adversarial review.
 | Server logs publisher keys | Never |
 | Server logs observer stream contents | Never |
 | Server logs extension proxy URLs, bodies, responses | Never |
+| Server logs link preview proxy URLs, bodies, responses | Never |
 | Server logs call signaling payloads | Never |
 | Server logs session signal payloads | Never |
 | Push notification reveals room_id and timing | Yes. Structurally necessary. |
 | Key transparency is independently verified | Only when auditors are configured. Default: not independently verified. |
 | KT API exposes `username_token` | Never. Stored in the KT log but excluded from all API responses. |
+| KT leaf serialization is reproducible | Yes. Canonical user and bot formats in §7.11. |
 | Extension proxy rejects Authorization and Cookie by header name | Yes. Custom-header credential forwarding is possible; build-time install is the control. |
 | Extension proxy forwards user IP addresses | No |
 | Extension proxy streams responses | No |
 | Extension proxy caches responses | No |
+| Link preview proxy caches responses | No |
+| Link preview proxy forwards user IP addresses | No |
+| Link preview proxy is unauthenticated | No. Requires a bearer session token. |
+| Shared static keypair between proxies | Yes. Distinct HKDF info strings prevent replay between them. |
 | Model files are immutable and content-addressed | Yes |
 | SPA bundle is version-coupled | Yes |
 | Multi-node deployments supported | No |
@@ -3174,7 +3298,7 @@ Call-scoped co-presence is permitted. Within a call or session, the server knows
 
 Bot connection status is permitted. It is a server-to-bot liveness indicator, scoped to the bot's own channel, visible only to the bot's owner. It is held in memory only. It is never written to any persistent store or external system. It is never logged. It is never synced.
 
-The extension proxy is blind. The server decrypts URLs, request bodies, and response bodies in memory only, uses them to fulfill the request, and discards them. No URL, no header value, no body byte is written to any persistent store, log file, stdout, stderr, metrics pipeline, tracing system, or monitoring system. Only aggregated request counts per user per extension per hour are retained for audit.
+The extension proxy and the link preview proxy are blind. The server decrypts URLs, request bodies, and response bodies in memory only, uses them to fulfill the request, and discards them. No URL, no header value, no body byte is written to any persistent store, log file, stdout, stderr, metrics pipeline, tracing system, or monitoring system. Only aggregated request counts per user per extension per hour are retained for audit.
 
 Encrypted extension and bot payloads are opaque to the server. The server does not decrypt, parse, validate, log, or inspect them. The server defines only the wire shape. The encryption scheme is a client-side implementation detail.
 
@@ -3188,9 +3312,9 @@ The Sockudo auth endpoint is not a generic HMAC oracle. It validates the channel
 
 ## 13. Backups and Disaster Recovery
 
-Backups include: the OPRF key file, the ALTCHA HMAC secret, the VAPID keys, the KT log directory, the session types config, the extension proxy domain blocklist, the `server_config` table (including the Sockudo app secret, treated as sensitive), and all other database contents. Model files included only if `BACKUP_INCLUDE_MODELS=true`. Session occupancy, call participation, bot connection status, observer cursors, and local messages are not part of any backup because they are not stored. Publisher keys persisted in `room_publisher_keys` are part of the database and are backed up with it.
+Backups include: the OPRF key file, the ALTCHA HMAC secret, the VAPID keys, the KT log directory, the session types config, the extension proxy domain blocklist, the `LINK_PREVIEW_PROXY_KEY_PATH` file, the `server_config` table (including the Sockudo app secret, treated as sensitive), and all other database contents. Model files included only if `BACKUP_INCLUDE_MODELS=true`. Session occupancy, call participation, bot connection status, observer cursors, local messages, and link preview request/response bodies are not part of any backup because they are not stored. Publisher keys persisted in `room_publisher_keys` are part of the database and are backed up with it.
 
-Restore order: OPRF key file → database → KT log directory → session types config → blocklist. Session occupancy and call participation begin empty on restart. Bot connection status begins empty on restart. Publisher keys are restored from the database; members republish only on epoch transition.
+Restore order: OPRF key file → database → KT log directory → session types config → blocklist → `LINK_PREVIEW_PROXY_KEY_PATH`. Session occupancy and call participation begin empty on restart. Bot connection status begins empty on restart. Publisher keys are restored from the database; members republish only on epoch transition.
 
 ---
 
@@ -3202,7 +3326,7 @@ Access, correction, deletion, portability, restriction. Exercised via `GET /user
 
 ### 14.2 Account Deletion
 
-Anonymises the user row, deletes devices, HTTP sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, room order, device names, starred items, bot settings). Queues MLS removes. Clears extension proxy rate-limit buckets. Publishes `account.deleted` on the user's own channel.
+Anonymises the user row, deletes devices, HTTP sessions, KeyPackages, push subscriptions, room memberships, recovery codes, and all user-scoped sync state (read state, preferences, room order, device names, starred items, bot settings). Queues MLS removes. Clears extension proxy and link preview proxy rate-limit buckets. Publishes `account.deleted` on the user's own channel.
 
 Identity columns on deletion: `username_token` set to a random 86-character base64url string; `encrypted_display` NULL; `profile` NULL.
 
@@ -3248,6 +3372,8 @@ Deleted rows are marked, not physically removed, until the retention window expi
 | Extension proxy request/response bodies | N/A | Decrypted in memory only; never logged. |
 | Extension proxy credentials | N/A | `Authorization` and `Cookie` rejected by header name. |
 | Extension proxy domain counts | N/A | Only aggregated hourly counts. |
+| Link preview proxy URLs | N/A | Decrypted in memory only; never logged. |
+| Link preview proxy request/response bodies | N/A | Decrypted in memory only; never logged. |
 | Model files | N/A | Immutable; not user data. |
 | Bot command payloads | N/A | Opaque; server relays. |
 | Bot command results | N/A | Opaque; server relays. |
@@ -3261,10 +3387,11 @@ Deleted rows are marked, not physically removed, until the retention window expi
 | `read_by_count` | Aggregate | Per message. No user identity. |
 | `sockudo_app_key` | Public | By Pusher design. |
 | `sockudo_app_secret` | Secret | `is_secret = 1` in `server_config`. Included in backups as sensitive. |
+| `LINK_PREVIEW_PROXY_KEY_PATH` | Static X25519 keypair | Public key is exposed; private key is secret. Included in backups as sensitive. |
 
 ### 14.7 Controller Obligations
 
-The controller's privacy policy must document: the username enumeration limitation, the session occupancy count disclosure, the call IP exposure, the call history visibility, the bot connection status disclosure to owners, the extension proxy existence, and what the server does and does not log. It must also state which metadata categories the server sees and which it does not.
+The controller's privacy policy must document: the username enumeration limitation, the session occupancy count disclosure, the call IP exposure, the call history visibility, the bot connection status disclosure to owners, the extension proxy existence, the link preview proxy existence, and what the server does and does not log. It must also state which metadata categories the server sees and which it does not.
 
 ### 14.8 Audit Actions
 
@@ -3284,6 +3411,7 @@ The controller's privacy policy must document: the username enumeration limitati
 - `session_types.reload`
 - `extension.proxy_request` (aggregated hourly count only)
 - `extension_proxy.reload_blocklist`
+- `link_preview.proxy_request` (aggregated hourly count only)
 - `bot.create`
 - `bot.grant`
 - `bot.revoke`
@@ -3296,7 +3424,7 @@ The controller's privacy policy must document: the username enumeration limitati
 - `bot.declaration_update`
 - `sockudo.config_generate`
 
-No audit entry is written for session join, leave, heartbeat, signal, occupancy change, call join, call leave, call signal, publisher key publish, extension proxy request, or Sockudo auth. That would create exactly the log this design refuses.
+No audit entry is written for session join, leave, heartbeat, signal, occupancy change, call join, call leave, call signal, publisher key publish, extension proxy request, link preview proxy request, or Sockudo auth. That would create exactly the log this design refuses.
 
 ---
 
@@ -3310,6 +3438,7 @@ No audit entry is written for session join, leave, heartbeat, signal, occupancy 
 | 3.0.1 | 2026-10-04 | Coordination patch. Corrected HKDF lengths for display/device names (32, not 44). Bot settings use X25519 ECDH. Added `bot_key_leaf_index`. Added `room_publisher_keys` table. Added `GET /rooms/:id/messages`, `GET /rooms/:id/calls`, `PATCH /bots/:id/keys`, `GET /kt/bot/:id`, `GET /kt/bot/:id/history`. Added `CALL_RECORD_RETENTION_DAYS`. Added `connected` field. Added bot message signature. Added signing encoding §8.10. Merged publisher key events. Full event catalog reconciliation. Whisper delivery includes sender's own user channel. |
 | 3.0.2 | 2026-10-04 | Final coordination patch. `connected` field restricted to owner-only. `read_by_count` attached to message fetch. Added `GET /welcomes` and `GET /welcomes/:id`. Added `room.transfer_accepted`, `bot.deleted`, `bot.created` events. `kt.snapshot` marked non-durable; added `GET /kt/snapshot`. `mls.remove_stale` fires once per row. `target_user_ids` stripped from all room channel payloads. `room.transfer_cancelled` channels corrected. Bot message signing and publisher key signing use length-prefixed encoding with big-endian integers. Event catalog frozen. |
 | 3.0.3 | 2026-10-06 | Sockudo connection and subscription authentication. Added `SOCKUDO_PUBLIC_URL`, `SOCKUDO_AUTH_PATH`; `SOCKUDO_APP_KEY` and `SOCKUDO_APP_SECRET` now auto-generate and persist. Added `server_config` table. Added `sockudo_url`, `sockudo_app_key`, `sockudo_auth_endpoint` to capabilities. Added `POST /sockudo/auth` (Pusher v7 HMAC, channel pattern validation, disabled-account rejection, rate limit 300/min). Added `GET /kt/user/:id`; `username_token` excluded from all KT API responses. Bot coordination: added `POST /bots/me/messages` (invoker + owner targets), `GET /bots/:id/tokens`; removed `POST /bots/me/commands/:id/result`; `POST /rooms/:id/bot-commands` gains `ephemeral_result_pubkey` and `request_id`; `POST /rooms/:id/bot-messages` gains `request_id`; `PATCH /bots/:id/keys` accepts bot token or owner session; `GET /bots/:id` returns `declarations`; `bot.command_invoked` gains `ephemeral_result_pubkey`; `bot.keys_rotated` added on owner user channel (durable); added `bot.command_result` and `bot.local_message`; added `bot_request_log` table; `bot_commands` gains `ephemeral_result_pubkey`, `result_at`, `result_type`; `bot_accounts` gains `declarations`; added §6.33 Publisher Key Encryption; added `RATE_BOT_COMMAND_RESULT_PER_MIN`, `RATE_BOT_LOCAL_MESSAGE_PER_MIN`, `RATE_SOCKUDO_AUTH_PER_MIN`. Bot message forward secrecy within epoch documented as not provided. |
+| 3.0.4 | 2026-10-11 | Content-key unification and KT leaf serialization. Rewrote §8.1.2 (link preview proxy) to use ephemeral-static X25519 ECDH, matching the extension proxy. The endpoint is authenticated; the rate limit is per user. Request/response field names are `ephemeral_pubkey`, `nonce`, `ciphertext`, matching §8.1.5. Added `extension_proxy_key` to `GET /capabilities`. Added `LINK_PREVIEW_PROXY_KEY_PATH` to §5.23. Clarified that both proxies share the same static keypair with distinct HKDF info strings. Added the shared key file row to §7.13. Added the file to backups in §5.9. Added the "Public ≠ unauthenticated" note under §8.1. Added `bot_identity_pubkey` column to `key_transparency_log`. Added the canonical leaf serialization subsection to §7.11 defining both user and bot leaf formats. Noted that the KT leaf serialization is a hashing preimage, not an Ed25519 signing preimage, and is therefore not part of §8.10. |
 
 No amendments are used. v3.0 is a clean document. Future changes are new versions.
 
@@ -3319,6 +3448,6 @@ No amendments are used. v3.0 is a clean document. Future changes are new version
 
 This is the contract for the server side of the system. Every v3.0 implementation task references this document. If a task conflicts with this spec, the task is wrong and must be revised. If a feature is missing, it does not exist yet — it must be added here first, then built.
 
-The event catalog in §8.9 is frozen. The signing encoding in §8.10 is frozen. The publisher key encryption scheme in §6.33 is frozen. Any change requires a new version.
+The event catalog in §8.9 is frozen. The signing encoding in §8.10 is frozen. The publisher key encryption scheme in §6.33 is frozen. The KT leaf serialization in §7.11 is frozen. Any change requires a new version.
 
-**End of Server Specification v3.0.3.**
+**End of Server Specification v3.0.4.**
